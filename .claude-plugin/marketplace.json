@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "clawvibe-plugins",
+  "description": "ClawVibe channel plugins for Claude Code — pair an iOS device and chat with a Claude Code session over a secure WebSocket.",
+  "owner": {
+    "name": "ClawVibe"
+  },
+  "plugins": [
+    {
+      "name": "clawvibe",
+      "description": "ClawVibe mobile channel — pair an iOS device and chat with this Claude Code instance over a secure WebSocket. Includes format directives ([SPEAK]/[TEXT]/---) for TTS-aware clients.",
+      "category": "channels",
+      "source": "./external_plugins/clawvibe",
+      "homepage": "https://github.com/ClawVibe/claude-plugins"
+    }
+  ]
+}
