@@ -228,8 +228,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
-await mcp.connect(new StdioServerTransport())
-
 // ── Inbound delivery ─────────────────────────────────────────────────────────
 
 type InboundMeta = {
@@ -485,3 +483,8 @@ function drainApprovalSentinels(): void {
   }
   if (changed) writeAccess(a)
 }
+
+// Start MCP stdio transport last — this holds the event loop open for the
+// duration of the Claude session. Bun.serve() must be called first so the
+// HTTP/WS server is bound before the MCP handshake completes.
+await mcp.connect(new StdioServerTransport())
