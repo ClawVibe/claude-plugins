@@ -1,0 +1,6 @@
+{
+  "name": "clawvibe",
+  "description": "ClawVibe mobile channel — pair an iOS device and chat with this Claude Code instance over a secure WebSocket. Includes format directives ([SPEAK]/[TEXT]/---) for TTS-aware clients.",
+  "version": "0.0.1",
+  "keywords": ["channel", "mobile", "ios", "clawvibe", "voice"]
+}
