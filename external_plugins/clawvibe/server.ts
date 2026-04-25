@@ -87,6 +87,8 @@ type BootstrapToken = {
   created_at: number
   expires_at: number
   used: boolean
+  paired_device_id?: string
+  paired_device_name?: string
 }
 
 type Access = {
@@ -108,6 +110,7 @@ function readAccess(): Access {
       dmPolicy: a.dmPolicy ?? 'pairing',
       approved: a.approved ?? {},
       pending: a.pending ?? {},
+      bootstrapTokens: a.bootstrapTokens,
     }
   } catch {
     return defaultAccess()
@@ -446,6 +449,11 @@ function handleConnect(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
       token: deviceToken,
       approved_at: Date.now(),
     }
+    // Record which device this bootstrap token paired
+    if (a.bootstrapTokens?.[bootstrapToken]) {
+      a.bootstrapTokens[bootstrapToken].paired_device_id = deviceId
+      a.bootstrapTokens[bootstrapToken].paired_device_name = deviceName
+    }
     writeAccess(a)
     device = a.approved[deviceId]
     process.stderr.write(`clawvibe: bootstrap paired device=${deviceId} name="${deviceName}"\n`)
@@ -703,6 +711,23 @@ Bun.serve<WSData>({
     if (url.pathname === '/bootstrap-token' && req.method === 'POST') {
       const { token, expiresAt } = newBootstrapToken()
       return Response.json({ bootstrapToken: token, expiresAt })
+    }
+
+    // Bootstrap token status: poll whether a token has been consumed (used by clawvibe qr)
+    if (url.pathname.startsWith('/bootstrap-token/') && req.method === 'GET') {
+      const token = url.pathname.slice('/bootstrap-token/'.length)
+      const a = readAccess()
+      const bt = a.bootstrapTokens?.[token]
+      if (!bt) return Response.json({ error: 'not found' }, { status: 404 })
+      if (bt.expires_at < Date.now() && !bt.used) return Response.json({ status: 'expired' })
+      if (bt.used) {
+        return Response.json({
+          status: 'paired',
+          device_id: bt.paired_device_id ?? null,
+          device_name: bt.paired_device_name ?? null,
+        })
+      }
+      return Response.json({ status: 'pending' })
     }
 
     // Pairing: request a code
