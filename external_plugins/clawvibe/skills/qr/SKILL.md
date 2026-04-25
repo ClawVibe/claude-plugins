@@ -5,64 +5,88 @@ description: Generate a ClawVibe pairing QR code for the iOS app to scan. Use wh
 
 # Generate ClawVibe pairing QR code
 
-The ClawVibe iOS app pairs by scanning a QR code containing the server URL. This skill generates that QR code.
+The ClawVibe iOS app pairs by scanning a QR code. The QR code uses the same
+format as OpenClaw: a JSON payload `{url, bootstrapToken, kind}` encoded as
+URL-safe base64 (no padding).
 
 ## Steps
 
-1. Determine the server URL. The plugin's HTTP server listens on `$CLAWVIBE_PORT` (default 8791) at `$CLAWVIBE_HOSTNAME` (default 127.0.0.1). The iOS app needs to reach this over the network — typically via Tailscale Serve or a reverse proxy.
+1. Determine the public URL. Check these sources in order:
+   - `$CLAWVIBE_PUBLIC_URL` env var (set by the daemon for SpongeBob)
+   - `$CLAWVIBE_STATE_DIR/public_url` file (manual config fallback)
+   - If neither exists, ask the user for their Tailscale hostname
 
-2. Check if Tailscale Serve is already exposing the port:
-```bash
-tailscale serve status 2>/dev/null
-```
-Look for a line like `https://hostname:8791 (tailnet only)` — that's the URL the iOS app should use.
+2. Generate a bootstrap token and QR code:
 
-If not exposed, the user needs to set it up:
-```bash
-tailscale serve --bg --set-path / --https 8791 http://localhost:8791
-```
-
-3. Generate the QR code payload (JSON):
-```json
-{"kind": "clawvibe", "url": "https://<tailscale-hostname>:8791"}
-```
-
-4. Generate the QR code using Python (available on the host):
 ```bash
 python3 -c "
-import json
+import json, sys, os, base64, urllib.request
+
+# Resolve public URL
+url = os.environ.get('CLAWVIBE_PUBLIC_URL', '')
+if not url:
+    state = os.environ.get('CLAWVIBE_STATE_DIR', os.path.expanduser('~/.claude/channels/clawvibe'))
+    uf = os.path.join(state, 'public_url')
+    if os.path.exists(uf):
+        url = open(uf).read().strip()
+if not url:
+    print('ERROR: No public URL configured.')
+    print('Set CLAWVIBE_PUBLIC_URL or create \$CLAWVIBE_STATE_DIR/public_url')
+    sys.exit(1)
+
+# Convert to wss:// for the gateway URL
+ws_url = url
+if ws_url.startswith('https://'):
+    ws_url = 'wss://' + ws_url[8:]
+elif ws_url.startswith('http://'):
+    ws_url = 'ws://' + ws_url[7:]
+
+# Get bootstrap token from the server
+port = os.environ.get('CLAWVIBE_PORT', '8791')
+hostname = os.environ.get('CLAWVIBE_HOSTNAME', '127.0.0.1')
+local_url = f'http://{hostname}:{port}/bootstrap-token'
+try:
+    req = urllib.request.Request(local_url, method='POST',
+        headers={'Content-Type': 'application/json'}, data=b'{}')
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        token_data = json.loads(resp.read())
+    bootstrap_token = token_data['bootstrapToken']
+except Exception as e:
+    print(f'ERROR: Could not get bootstrap token from {local_url}: {e}')
+    print('Is the ClawVibe server running?')
+    sys.exit(1)
+
+# Build payload in OpenClaw format with kind discriminator
+payload = json.dumps({
+    'url': ws_url,
+    'bootstrapToken': bootstrap_token,
+    'kind': 'clawvibe'
+})
+
+# Encode as URL-safe base64 (no padding) — same as OpenClaw's encodePairingSetupCode
+encoded = base64.urlsafe_b64encode(payload.encode('utf-8')).decode('ascii').rstrip('=')
+
+# Generate QR code
 try:
     import qrcode
-    payload = json.dumps({'kind': 'clawvibe', 'url': 'SERVER_URL_HERE'})
-    img = qrcode.make(payload)
-    path = '/tmp/clawvibe-pair.png'
-    img.save(path)
-    print(f'QR code saved to {path}')
 except ImportError:
-    print('Installing qrcode library...')
     import subprocess
-    subprocess.run(['pip3', 'install', 'qrcode[pil]'], capture_output=True)
+    subprocess.run([sys.executable, '-m', 'pip', 'install', 'qrcode'], capture_output=True)
     import qrcode
-    payload = json.dumps({'kind': 'clawvibe', 'url': 'SERVER_URL_HERE'})
-    img = qrcode.make(payload)
-    path = '/tmp/clawvibe-pair.png'
-    img.save(path)
-    print(f'QR code saved to {path}')
+
+qr = qrcode.QRCode(box_size=1, border=1)
+qr.add_data(encoded)
+qr.make()
+qr.print_ascii(invert=True)
+print()
+print(f'Server:  {ws_url}')
+print(f'Token expires in 10 minutes')
 "
 ```
 
-5. Show the QR code to the user by reading the generated PNG file. Use the Read tool on `/tmp/clawvibe-pair.png` to display it inline.
-
-6. Tell the user to:
+3. Tell the user:
    - Open the ClawVibe iOS app
-   - Go to Settings (or the setup screen)
-   - Tap "Scan QR Code"
-   - Scan the displayed QR code
-   - Wait for the pairing code to appear in the server logs
-   - You will then approve it via `/clawvibe:access pair <CODE>`
-
-## Important
-
-- Always check `tailscale serve status` first to find the correct public URL
-- The QR payload must have `"kind": "clawvibe"` — this tells the iOS app to use the ClawVibe pairing flow instead of the OpenClaw flow
-- After scanning, the iOS app POSTs to `/pair/request`, then polls `/pair/status`. The server logs the 5-letter pairing code to stderr.
+   - Go to the setup screen (Settings → Unpair, or first launch)
+   - Tap **Scan QR Code**
+   - Scan the QR code shown above
+   - The device will be automatically paired — no approval code needed

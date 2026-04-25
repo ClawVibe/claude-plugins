@@ -83,10 +83,17 @@ type ApprovedDevice = {
   last_seen_at?: number
 }
 
+type BootstrapToken = {
+  created_at: number
+  expires_at: number
+  used: boolean
+}
+
 type Access = {
   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
   approved: Record<string, ApprovedDevice>   // keyed by device_id
   pending: Record<string, PendingPair>        // keyed by pairing code (5 letters)
+  bootstrapTokens?: Record<string, BootstrapToken>
 }
 
 function defaultAccess(): Access {
@@ -127,6 +134,36 @@ function tokenToDevice(token: string): ApprovedDevice | undefined {
   const a = readAccess()
   for (const d of Object.values(a.approved)) if (d.token === token) return d
   return undefined
+}
+
+function newBootstrapToken(): { token: string; expiresAt: number } {
+  const token = randomBytes(32).toString('base64url')
+  const expiresAt = Date.now() + 10 * 60 * 1000
+  const a = readAccess()
+  if (!a.bootstrapTokens) a.bootstrapTokens = {}
+  // Prune expired tokens
+  for (const [k, v] of Object.entries(a.bootstrapTokens)) {
+    if (v.expires_at < Date.now()) delete a.bootstrapTokens[k]
+  }
+  a.bootstrapTokens[token] = { created_at: Date.now(), expires_at: expiresAt, used: false }
+  writeAccess(a)
+  return { token, expiresAt }
+}
+
+function validateBootstrapToken(token: string): boolean {
+  const a = readAccess()
+  const bt = a.bootstrapTokens?.[token]
+  if (!bt || bt.used || bt.expires_at < Date.now()) return false
+  return true
+}
+
+function consumeBootstrapToken(token: string): boolean {
+  const a = readAccess()
+  const bt = a.bootstrapTokens?.[token]
+  if (!bt || bt.used || bt.expires_at < Date.now()) return false
+  bt.used = true
+  writeAccess(a)
+  return true
 }
 
 // ── MCP server ───────────────────────────────────────────────────────────────
@@ -374,10 +411,50 @@ function handleConnect(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   const params = req.params ?? {}
   const auth = params.auth as Record<string, unknown> | undefined
   const token = (auth?.token as string) ?? ''
+  const bootstrapToken = (auth?.bootstrapToken as string) ?? ''
 
-  const device = tokenToDevice(token)
+  let device: ApprovedDevice | undefined
+
+  if (bootstrapToken) {
+    // Bootstrap token auth: auto-approve this device and issue a device token
+    if (!consumeBootstrapToken(bootstrapToken)) {
+      sendFrame(ws, {
+        type: 'res',
+        id: req.id,
+        ok: false,
+        error: {
+          message: 'invalid or expired bootstrap token',
+          details: {
+            code: 'PAIRING_REQUIRED',
+            reason: 'bootstrap-invalid',
+            pauseReconnect: true,
+            userMessage: 'This pairing code has expired. Generate a new QR code and try again.',
+          },
+        },
+      })
+      return
+    }
+    const deviceField = params.device as Record<string, unknown> | undefined
+    const clientField = params.client as Record<string, unknown> | undefined
+    const deviceId = (deviceField?.deviceId as string) ?? `device-${randomBytes(8).toString('hex')}`
+    const deviceName = (clientField?.clientDisplayName as string) ?? 'ClawVibe device'
+    const deviceToken = newToken()
+    const a = readAccess()
+    a.approved[deviceId] = {
+      device_id: deviceId,
+      device_name: deviceName,
+      token: deviceToken,
+      approved_at: Date.now(),
+    }
+    writeAccess(a)
+    device = a.approved[deviceId]
+    process.stderr.write(`clawvibe: bootstrap paired device=${deviceId} name="${deviceName}"\n`)
+  } else {
+    device = tokenToDevice(token)
+  }
+
   if (!device) {
-    const res: ResponseFrame = {
+    sendFrame(ws, {
       type: 'res',
       id: req.id,
       ok: false,
@@ -390,8 +467,7 @@ function handleConnect(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
           userMessage: 'Open ClawVibe settings and scan the QR code to pair this device.',
         },
       },
-    }
-    sendFrame(ws, res)
+    })
     return
   }
 
@@ -433,7 +509,11 @@ function handleConnect(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
         updateAvailable: null,
       },
       canvasHostUrl: null,
-      auth: { deviceToken: device.token },
+      auth: {
+        deviceToken: device.token,
+        role: 'operator',
+        scopes: ['operator.read', 'operator.write'],
+      },
       policy: { tickIntervalMs: TICK_INTERVAL_MS },
     },
   }
@@ -617,6 +697,12 @@ Bun.serve<WSData>({
       } catch {
         return Response.json([])
       }
+    }
+
+    // Bootstrap token: generate a one-time token for QR-based pairing
+    if (url.pathname === '/bootstrap-token' && req.method === 'POST') {
+      const { token, expiresAt } = newBootstrapToken()
+      return Response.json({ bootstrapToken: token, expiresAt })
     }
 
     // Pairing: request a code
