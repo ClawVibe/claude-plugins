@@ -331,6 +331,16 @@ Bun.serve<WSData>({
       return Response.json({ ok: true, server: 'clawvibe', version: '0.0.1' })
     }
 
+    // Agent discovery — iOS app fetches this to build the agent picker.
+    if (url.pathname === '/agents' && req.method === 'GET') {
+      try {
+        const raw = readFileSync(join(STATE_DIR, 'agents.json'), 'utf8')
+        return Response.json(JSON.parse(raw))
+      } catch {
+        return Response.json([])
+      }
+    }
+
     // Pairing: request a code
     if (url.pathname === '/pair/request' && req.method === 'POST') {
       return (async () => {
