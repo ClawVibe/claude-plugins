@@ -8,6 +8,10 @@
  * `notifications/claude/channel` notifications; the agent replies via the
  * `reply` tool, which broadcasts to connected device(s).
  *
+ * Wire protocol: speaks the OpenClaw gateway protocol so the iOS app's
+ * GatewayChannelActor handles connection lifecycle, reconnection, keepalive,
+ * and error classification identically for both OpenClaw and ClawCode backends.
+ *
  * State in $CLAWVIBE_STATE_DIR (default ~/.claude/channels/clawvibe/):
  *   access.json            — dmPolicy, pending pairs, approved devices, tokens
  *   approved/<device_id>   — sentinel file, signals pairing approved
@@ -38,6 +42,8 @@ const APPROVED_DIR = join(STATE_DIR, 'approved')
 const PID_FILE = join(STATE_DIR, 'server.pid')
 const PORT = Number(process.env.CLAWVIBE_PORT ?? 8791)
 const HOSTNAME = process.env.CLAWVIBE_HOSTNAME ?? '127.0.0.1'
+const TICK_INTERVAL_MS = 30_000
+const startedAt = Date.now()
 
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(APPROVED_DIR, { recursive: true, mode: 0o700 })
@@ -107,7 +113,6 @@ function writeAccess(a: Access): void {
 }
 
 function newPairCode(): string {
-  // 5 letters a-z minus 'l' (confusable with 1/I), uppercase for QR legibility.
   const alpha = 'ABCDEFGHIJKMNOPQRSTUVWXYZ'
   let s = ''
   for (const b of randomBytes(5)) s += alpha[b % alpha.length]
@@ -118,8 +123,6 @@ function newToken(): string {
   return randomBytes(32).toString('base64url')
 }
 
-// Re-read access.json on each check so the /clawvibe:access skill's edits
-// land without a server restart (matches telegram's semantics).
 function tokenToDevice(token: string): ApprovedDevice | undefined {
   const a = readAccess()
   for (const d of Object.values(a.approved)) if (d.token === token) return d
@@ -194,24 +197,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const replyTo = args.reply_to as string | undefined
         const id = nextMsgId()
-        broadcast({
-          type: 'message.final',
-          message_id: id,
-          conversation_id: conversationId,
-          text,
-          reply_to: replyTo,
-          ts: Date.now(),
-        })
+        // Find the active runId for this conversation to correlate the reply
+        const runId = activeRuns.get(conversationId) ?? id
+        broadcastChatEvent(runId, conversationId, 'final', text)
+        activeRuns.delete(conversationId)
         return { content: [{ type: 'text', text: `sent (${id})` }] }
       }
       case 'edit_message': {
-        broadcast({
-          type: 'message.edit',
-          message_id: args.message_id as string,
-          conversation_id: (args.conversation_id as string | undefined) ?? 'default',
-          text: args.text as string,
-          ts: Date.now(),
-        })
+        const messageId = args.message_id as string
+        const conversationId = (args.conversation_id as string | undefined) ?? 'default'
+        const text = args.text as string
+        broadcastChatEvent(messageId, conversationId, 'final', text)
         return { content: [{ type: 'text', text: 'ok' }] }
       }
       default:
@@ -248,7 +244,7 @@ function deliverInbound(text: string, meta: InboundMeta): void {
       content: text,
       meta: {
         source: 'clawvibe',
-        chat_id: meta.conversation_id, // fakechat/telegram naming compat
+        chat_id: meta.conversation_id,
         message_id: meta.message_id,
         user: meta.device_name,
         ts: meta.ts,
@@ -262,53 +258,293 @@ function deliverInbound(text: string, meta: InboundMeta): void {
   })
 }
 
-// ── WS broadcast ─────────────────────────────────────────────────────────────
+// ── Gateway protocol types ──────────────────────────────────────────────────
 
-type WSData = { device_id: string; device_name: string }
-const clients = new Map<string, Set<ServerWebSocket<WSData>>>() // device_id -> sockets
+type RequestFrame = {
+  type: 'req'
+  id: string
+  method: string
+  params?: Record<string, unknown>
+}
+
+type ResponseFrame = {
+  type: 'res'
+  id: string
+  ok: boolean
+  payload?: unknown
+  error?: { message: string; details?: Record<string, unknown> }
+}
+
+type EventFrame = {
+  type: 'event'
+  event: string
+  payload: unknown
+  seq: number | null
+  stateVersion: unknown
+}
+
+// ── WS state ────────────────────────────────────────────────────────────────
+
+type WSData = {
+  device_id: string
+  device_name: string
+  authenticated: boolean
+  sessionKey?: string
+}
+
+const clients = new Map<string, Set<ServerWebSocket<WSData>>>()
+// Track active run_id per conversation for reply correlation
+const activeRuns = new Map<string, string>()
 
 let msgSeq = 0
+let eventSeq = 0
 function nextMsgId(): string {
   return `m${Date.now()}-${++msgSeq}`
 }
-
-type OutFrame =
-  | { type: 'message.delta'; run_id?: string; conversation_id: string; text: string }
-  | {
-      type: 'message.final'
-      message_id: string
-      conversation_id: string
-      text: string
-      reply_to?: string
-      ts: number
-      run_id?: string
-    }
-  | {
-      type: 'message.edit'
-      message_id: string
-      conversation_id: string
-      text: string
-      ts: number
-    }
-  | { type: 'permission.request'; request_id: string; tool: string; description?: string; preview?: unknown }
-  | { type: 'permission.result'; request_id: string; allowed: boolean }
-  | { type: 'pong' }
-  | { type: 'tick'; ts: number }
-  | { type: 'error'; message: string; run_id?: string }
-
-function broadcast(frame: OutFrame, targetDeviceId?: string): void {
-  const data = JSON.stringify(frame)
-  const send = (ws: ServerWebSocket<WSData>) => { if (ws.readyState === 1) ws.send(data) }
-  if (targetDeviceId) clients.get(targetDeviceId)?.forEach(send)
-  else for (const set of clients.values()) set.forEach(send)
+function nextEventSeq(): number {
+  return ++eventSeq
 }
 
-// 30s keepalive.
-setInterval(() => broadcast({ type: 'tick', ts: Date.now() }), 30_000)
+// ── Broadcast helpers ───────────────────────────────────────────────────────
 
-// ── HTTP + WS server ─────────────────────────────────────────────────────────
+function sendFrame(ws: ServerWebSocket<WSData>, frame: ResponseFrame | EventFrame): void {
+  if (ws.readyState === 1) ws.send(JSON.stringify(frame))
+}
 
-type InFrame =
+function broadcastEvent(frame: EventFrame, targetDeviceId?: string): void {
+  let sent = 0, skipped = 0
+  const send = (ws: ServerWebSocket<WSData>) => {
+    if (!ws.data.authenticated) { skipped++; return }
+    if (ws.readyState === 1) { ws.send(JSON.stringify(frame)); sent++ }
+    else { skipped++ }
+  }
+  if (targetDeviceId) clients.get(targetDeviceId)?.forEach(send)
+  else for (const set of clients.values()) set.forEach(send)
+  if (frame.event !== 'tick') {
+    process.stderr.write(`clawvibe: broadcast event=${frame.event} sent=${sent} skipped=${skipped}\n`)
+  }
+}
+
+function broadcastChatEvent(
+  runId: string,
+  sessionKey: string,
+  state: 'delta' | 'final' | 'error' | 'aborted',
+  text?: string,
+  errorMessage?: string,
+): void {
+  const payload: Record<string, unknown> = {
+    runId,
+    sessionKey,
+    seq: 0,
+    state,
+  }
+  if (text !== undefined) {
+    payload.message = {
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      timestamp: new Date().toISOString(),
+    }
+  }
+  if (errorMessage !== undefined) {
+    payload.errorMessage = errorMessage
+  }
+  broadcastEvent({
+    type: 'event',
+    event: 'chat',
+    payload,
+    seq: nextEventSeq(),
+    stateVersion: null,
+  })
+}
+
+// 30s tick keepalive in OpenClaw EventFrame format
+setInterval(() => {
+  broadcastEvent({
+    type: 'event',
+    event: 'tick',
+    payload: null,
+    seq: nextEventSeq(),
+    stateVersion: null,
+  })
+}, TICK_INTERVAL_MS)
+
+// ── RPC handlers ────────────────────────────────────────────────────────────
+
+function handleConnect(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
+  const params = req.params ?? {}
+  const auth = params.auth as Record<string, unknown> | undefined
+  const token = (auth?.token as string) ?? ''
+
+  const device = tokenToDevice(token)
+  if (!device) {
+    const res: ResponseFrame = {
+      type: 'res',
+      id: req.id,
+      ok: false,
+      error: {
+        message: 'device not paired',
+        details: {
+          code: 'PAIRING_REQUIRED',
+          reason: 'not-paired',
+          pauseReconnect: true,
+          userMessage: 'Open ClawVibe settings and scan the QR code to pair this device.',
+        },
+      },
+    }
+    sendFrame(ws, res)
+    return
+  }
+
+  // Authenticate the socket
+  ws.data.device_id = device.device_id
+  ws.data.device_name = device.device_name
+  ws.data.authenticated = true
+
+  // Register in clients map
+  let set = clients.get(device.device_id)
+  if (!set) { set = new Set(); clients.set(device.device_id, set) }
+  set.add(ws)
+
+  // Touch last_seen
+  const a = readAccess()
+  if (a.approved[device.device_id]) {
+    a.approved[device.device_id].last_seen_at = Date.now()
+    writeAccess(a)
+  }
+
+  const helloOk: ResponseFrame = {
+    type: 'res',
+    id: req.id,
+    ok: true,
+    payload: {
+      type: 'hello_ok',
+      protocol: 3,
+      server: { name: 'clawvibe', version: '0.0.1' },
+      features: {},
+      snapshot: {
+        presence: [],
+        health: { ok: true },
+        stateVersion: { presence: 0, health: 0 },
+        uptimeMs: Date.now() - startedAt,
+        configPath: null,
+        stateDir: null,
+        sessionDefaults: null,
+        authMode: null,
+        updateAvailable: null,
+      },
+      canvasHostUrl: null,
+      auth: { deviceToken: device.token },
+      policy: { tickIntervalMs: TICK_INTERVAL_MS },
+    },
+  }
+  sendFrame(ws, helloOk)
+  process.stderr.write(`clawvibe: device authenticated id=${device.device_id} name="${device.device_name}"\n`)
+}
+
+function handleChatSend(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
+  const params = req.params ?? {}
+  const sessionKey = (params.sessionKey as string) ?? `device:${ws.data.device_id}`
+  const message = (params.message as string) ?? ''
+  const idempotencyKey = (params.idempotencyKey as string) ?? ''
+
+  const runId = nextMsgId()
+  const conversationId = sessionKey
+
+  // Track for reply correlation
+  activeRuns.set(conversationId, runId)
+
+  // Parse sensory tags from the message (iOS embeds them inline)
+  let context: string | undefined
+  let location: string | undefined
+  let voiceData: unknown | undefined
+
+  const contextMatch = message.match(/\[CONTEXT:\s*(.+?)\]/)
+  if (contextMatch) context = contextMatch[1]
+  const locationMatch = message.match(/\[LOCATION:\s*(.+?)\]/)
+  if (locationMatch) location = locationMatch[1]
+  const voiceDataMatch = message.match(/\[VOICE_DATA:\s*(.+?)\]/)
+  if (voiceDataMatch) {
+    try { voiceData = JSON.parse(voiceDataMatch[1]) } catch {}
+  }
+
+  process.stderr.write(`clawvibe: chat.send runId=${runId} session=${sessionKey} text="${message.slice(0, 80)}"\n`)
+
+  deliverInbound(message, {
+    device_id: ws.data.device_id,
+    device_name: ws.data.device_name,
+    conversation_id: conversationId,
+    message_id: runId,
+    ts: new Date().toISOString(),
+    context,
+    location,
+    voice_data: voiceData,
+  })
+
+  // Respond with the runId so iOS can correlate events
+  const res: ResponseFrame = {
+    type: 'res',
+    id: req.id,
+    ok: true,
+    payload: { runId },
+  }
+  sendFrame(ws, res)
+}
+
+function handleHealth(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
+  sendFrame(ws, { type: 'res', id: req.id, ok: true, payload: { ok: true } })
+}
+
+function handleAgentsList(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
+  let agents: Array<{ id: string; name: string; emoji?: string }> = []
+  try {
+    const raw = readFileSync(join(STATE_DIR, 'agents.json'), 'utf8')
+    agents = JSON.parse(raw) as typeof agents
+  } catch {}
+
+  const defaultId = agents.length > 0 ? agents[0].id : 'default'
+  const result = {
+    defaultId,
+    mainKey: `agent:${defaultId}`,
+    scope: 'all',
+    agents: agents.map(a => ({
+      id: a.id,
+      name: a.name,
+      identity: { name: a.name, emoji: a.emoji ?? null },
+      workspace: null,
+      model: null,
+    })),
+  }
+  sendFrame(ws, { type: 'res', id: req.id, ok: true, payload: result })
+}
+
+function handleRPC(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
+  switch (req.method) {
+    case 'connect':
+      handleConnect(ws, req)
+      return
+    case 'chat.send':
+      handleChatSend(ws, req)
+      return
+    case 'health':
+      handleHealth(ws, req)
+      return
+    case 'agents.list':
+      handleAgentsList(ws, req)
+      return
+    default:
+      sendFrame(ws, {
+        type: 'res',
+        id: req.id,
+        ok: false,
+        error: { message: `unknown method: ${req.method}` },
+      })
+  }
+}
+
+// ── Legacy protocol support ─────────────────────────────────────────────────
+// Backward compat: the old ClawVibeChannelConnector uses a simpler frame format.
+
+type LegacyInFrame =
   | {
       type: 'chat.send'
       run_id: string
@@ -320,6 +556,48 @@ type InFrame =
   | { type: 'permission.reply'; request_id: string; allowed: boolean }
   | { type: 'ping' }
 
+function isLegacyFrame(frame: unknown): frame is LegacyInFrame {
+  if (!frame || typeof frame !== 'object') return false
+  const f = frame as Record<string, unknown>
+  return f.type === 'chat.send' || f.type === 'chat.abort' ||
+         f.type === 'permission.reply' || f.type === 'ping'
+}
+
+function handleLegacyFrame(ws: ServerWebSocket<WSData>, frame: LegacyInFrame): void {
+  switch (frame.type) {
+    case 'ping':
+      ws.send(JSON.stringify({ type: 'pong' }))
+      return
+    case 'chat.send': {
+      const parts = [frame.text]
+      if (frame.tags?.context) parts.push(`[CONTEXT: ${frame.tags.context}]`)
+      if (frame.tags?.location) parts.push(`[LOCATION: ${frame.tags.location}]`)
+      if (frame.tags?.voice_data) parts.push(`[VOICE_DATA: ${JSON.stringify(frame.tags.voice_data)}]`)
+      const runId = frame.run_id
+      const conversationId = frame.conversation_id || 'default'
+      activeRuns.set(conversationId, runId)
+      deliverInbound(parts.join('\n'), {
+        device_id: ws.data.device_id,
+        device_name: ws.data.device_name,
+        conversation_id: conversationId,
+        message_id: runId,
+        ts: new Date().toISOString(),
+        context: frame.tags?.context,
+        location: frame.tags?.location,
+        voice_data: frame.tags?.voice_data,
+      })
+      return
+    }
+    case 'chat.abort':
+      process.stderr.write(`clawvibe: abort run_id=${frame.run_id}\n`)
+      return
+    case 'permission.reply':
+      return
+  }
+}
+
+// ── HTTP + WS server ─────────────────────────────────────────────────────────
+
 Bun.serve<WSData>({
   port: PORT,
   hostname: HOSTNAME,
@@ -327,7 +605,7 @@ Bun.serve<WSData>({
     const url = new URL(req.url)
 
     // Health
-    if (url.pathname === '/' || url.pathname === '/health') {
+    if ((url.pathname === '/' || url.pathname === '/health') && !req.headers.get('upgrade')) {
       return Response.json({ ok: true, server: 'clawvibe', version: '0.0.1' })
     }
 
@@ -354,7 +632,6 @@ Bun.serve<WSData>({
         if (a.dmPolicy === 'disabled') {
           return Response.json({ error: 'pairing disabled' }, { status: 403 })
         }
-        // Dedupe any prior pending entries for this device.
         for (const [code, p] of Object.entries(a.pending)) {
           if (p.device_id === deviceId) delete a.pending[code]
         }
@@ -364,7 +641,7 @@ Bun.serve<WSData>({
           device_id: deviceId,
           device_name: deviceName,
           created_at: now,
-          expires_at: now + 10 * 60 * 1000, // 10 min
+          expires_at: now + 10 * 60 * 1000,
         }
         writeAccess(a)
 
@@ -380,7 +657,6 @@ Bun.serve<WSData>({
     if (url.pathname === '/pair/status' && req.method === 'GET') {
       const deviceId = url.searchParams.get('device_id')
       if (!deviceId) return Response.json({ error: 'device_id required' }, { status: 400 })
-      // Drain any stale approved/<device_id> sentinels into access.json first.
       drainApprovalSentinels()
       const a = readAccess()
       const approved = a.approved[deviceId]
@@ -395,12 +671,18 @@ Bun.serve<WSData>({
       return Response.json({ status: hasPending ? 'pending' : 'unknown' })
     }
 
-    // WebSocket upgrade
+    // Gateway protocol: WebSocket upgrade at root path (new)
+    if (url.pathname === '/' && req.headers.get('upgrade')?.toLowerCase() === 'websocket') {
+      if (server.upgrade(req, { data: { device_id: '', device_name: '', authenticated: false } })) return
+      return new Response('upgrade failed', { status: 400 })
+    }
+
+    // Legacy: WebSocket upgrade at /ws with token in query (backward compat)
     if (url.pathname === '/ws') {
       const token = url.searchParams.get('device_token') ?? ''
       const device = tokenToDevice(token)
       if (!device) return new Response('unauthorized', { status: 401 })
-      if (server.upgrade(req, { data: { device_id: device.device_id, device_name: device.device_name } })) return
+      if (server.upgrade(req, { data: { device_id: device.device_id, device_name: device.device_name, authenticated: true } })) return
       return new Response('upgrade failed', { status: 400 })
     }
 
@@ -409,55 +691,76 @@ Bun.serve<WSData>({
 
   websocket: {
     open(ws) {
-      let set = clients.get(ws.data.device_id)
-      if (!set) { set = new Set(); clients.set(ws.data.device_id, set) }
-      set.add(ws)
-      // Touch last_seen.
-      const a = readAccess()
-      if (a.approved[ws.data.device_id]) {
-        a.approved[ws.data.device_id].last_seen_at = Date.now()
-        writeAccess(a)
+      if (ws.data.authenticated) {
+        // Legacy path: already authenticated via /ws?device_token=X
+        let set = clients.get(ws.data.device_id)
+        if (!set) { set = new Set(); clients.set(ws.data.device_id, set) }
+        set.add(ws)
+        process.stderr.write(`clawvibe: ws open (legacy) device=${ws.data.device_id}\n`)
+        const a = readAccess()
+        if (a.approved[ws.data.device_id]) {
+          a.approved[ws.data.device_id].last_seen_at = Date.now()
+          writeAccess(a)
+        }
+      } else {
+        // Gateway protocol: send connect.challenge immediately
+        const nonce = randomBytes(16).toString('hex')
+        const challenge: EventFrame = {
+          type: 'event',
+          event: 'connect.challenge',
+          payload: { nonce },
+          seq: null,
+          stateVersion: null,
+        }
+        sendFrame(ws, challenge)
+        process.stderr.write(`clawvibe: ws open (gateway) — sent challenge\n`)
       }
     },
-    close(ws) {
-      clients.get(ws.data.device_id)?.delete(ws)
+    close(ws, code, reason) {
+      if (ws.data.device_id) {
+        clients.get(ws.data.device_id)?.delete(ws)
+      }
+      process.stderr.write(`clawvibe: ws close device=${ws.data.device_id || '(unauthenticated)'} code=${code}\n`)
     },
     message(ws, raw) {
-      let frame: InFrame
-      try { frame = JSON.parse(String(raw)) as InFrame } catch { return }
-      switch (frame.type) {
-        case 'ping':
-          ws.send(JSON.stringify({ type: 'pong' }))
-          return
-        case 'chat.send': {
-          // Compose message with sensory tags appended (stable order).
-          const parts = [frame.text]
-          if (frame.tags?.context) parts.push(`[CONTEXT: ${frame.tags.context}]`)
-          if (frame.tags?.location) parts.push(`[LOCATION: ${frame.tags.location}]`)
-          if (frame.tags?.voice_data) parts.push(`[VOICE_DATA: ${JSON.stringify(frame.tags.voice_data)}]`)
-          deliverInbound(parts.join('\n'), {
-            device_id: ws.data.device_id,
-            device_name: ws.data.device_name,
-            conversation_id: frame.conversation_id || 'default',
-            message_id: frame.run_id,
-            ts: new Date().toISOString(),
-            context: frame.tags?.context,
-            location: frame.tags?.location,
-            voice_data: frame.tags?.voice_data,
+      let parsed: unknown
+      try { parsed = JSON.parse(String(raw)) } catch {
+        process.stderr.write(`clawvibe: ws bad frame: ${String(raw).slice(0, 200)}\n`)
+        return
+      }
+
+      const frame = parsed as Record<string, unknown>
+
+      // Gateway protocol: RequestFrame has type="req"
+      if (frame.type === 'req' && typeof frame.id === 'string' && typeof frame.method === 'string') {
+        const req = frame as unknown as RequestFrame
+        // Allow connect before authentication; everything else requires it
+        if (req.method !== 'connect' && !ws.data.authenticated) {
+          sendFrame(ws, {
+            type: 'res',
+            id: req.id,
+            ok: false,
+            error: {
+              message: 'not authenticated',
+              details: { code: 'AUTH_TOKEN_MISSING', pauseReconnect: true },
+            },
           })
           return
         }
-        case 'chat.abort':
-          // Surface an abort-style error; the agent sees no direct signal
-          // in this first-pass implementation. Follow-up: translate into a
-          // claude/channel/abort notification when that capability lands.
-          process.stderr.write(`clawvibe: abort run_id=${frame.run_id}\n`)
-          return
-        case 'permission.reply':
-          // Permission relay follow-up lands the reply here and emits
-          // notifications/claude/channel/permission. First pass: no-op.
-          return
+        process.stderr.write(`clawvibe: ws rpc method=${req.method} device=${ws.data.device_id || '(pending)'}\n`)
+        handleRPC(ws, req)
+        return
       }
+
+      // Legacy protocol: simple typed frames (chat.send, ping, etc.)
+      if (isLegacyFrame(parsed)) {
+        if (!ws.data.authenticated) return
+        process.stderr.write(`clawvibe: ws legacy recv type=${frame.type} device=${ws.data.device_id}\n`)
+        handleLegacyFrame(ws, parsed)
+        return
+      }
+
+      process.stderr.write(`clawvibe: ws unknown frame type=${frame.type}\n`)
     },
   },
 })
@@ -465,9 +768,6 @@ Bun.serve<WSData>({
 process.stderr.write(`clawvibe: listening on http://${HOSTNAME}:${PORT}\n`)
 
 // ── Approval sentinels ───────────────────────────────────────────────────────
-// The `/clawvibe:access pair <code>` skill writes an empty file named
-// `approved/<device_id>` to signal "this device is approved; issue a token."
-// We drain those sentinels into access.json when checked.
 
 function drainApprovalSentinels(): void {
   let names: string[] = []
@@ -476,7 +776,6 @@ function drainApprovalSentinels(): void {
   const a = readAccess()
   let changed = false
   for (const deviceId of names) {
-    // Find the pending entry for this device_id, promote to approved.
     const code = Object.keys(a.pending).find(c => a.pending[c].device_id === deviceId)
     if (code) {
       const p = a.pending[code]
