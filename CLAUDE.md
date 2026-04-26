@@ -1,3 +1,9 @@
+## MUST Follow
+- Don't assume. Don't hide confusion. Surface tradeoffs.
+- Minimum code that solves the problem. Nothing speculative.
+- Touch only what you must. Clean up only your own mess.
+- Define success criteria. Loop until verified.
+
 # ClawVibe Channel Plugin for Claude Code
 
 Claude Code channel plugin that connects the ClawVibe iOS app to Claude Code agents (specifically SpongeBob on ClawCode). Speaks the **OpenClaw gateway wire protocol** so the iOS app's `GatewayChannelActor` handles both OpenClaw and ClawCode connections identically — full reconnection, keepalive, error classification.
@@ -74,6 +80,16 @@ clawcode qr              # runs clawvibe qr inside the container
 - **Dev testing bypass**: `--dangerously-load-development-channels plugin:clawvibe@clawvibe-plugins` skips the allowlist (still requires `channelsEnabled: true`).
 - **MCP tool names**: colons become underscores in permission rules. `plugin:clawvibe:clawvibe` → `mcp__plugin_clawvibe_clawvibe__<tool>`.
 - **Tailscale inside container**: WebSocket upgrades require HTTP/1.1. Host-side Tailscale Serve uses HTTP/2 which breaks WS upgrades. Tailscale must run inside the container (same as OpenClaw's setup).
+- **`CLAWVIBE_HOSTNAME` must be `127.0.0.1`**, not `0.0.0.0`. Tailscale serve binds the Tailscale IP on the plugin port; `0.0.0.0` conflicts. The supervisor sets this in the subprocess env.
+
+## Reconnection
+
+The server handles iOS reconnection after network disruptions:
+- **Stdin close → exit**: prevents orphan bun processes holding the port when the parent (Claude Code) dies.
+- **10s handshake timeout**: unauthenticated gateway sockets that don't complete `connect` within 10s get closed.
+- **Dead socket reaper**: runs every 30s in the tick interval, removes sockets with `readyState !== 1`.
+- **Stale socket eviction**: when the same `device_id` reconnects, old sockets are closed with code 4000.
+- **activeRuns TTL**: entries older than 5 minutes are pruned to prevent stale run tracking.
 
 ## Development
 
