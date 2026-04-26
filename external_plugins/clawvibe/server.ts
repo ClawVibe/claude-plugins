@@ -296,7 +296,7 @@ type InboundMeta = {
 }
 
 function deliverInbound(text: string, meta: InboundMeta): void {
-  void mcp.notification({
+  mcp.notification({
     method: 'notifications/claude/channel',
     params: {
       content: text,
@@ -310,11 +310,13 @@ function deliverInbound(text: string, meta: InboundMeta): void {
         conversation_id: meta.conversation_id,
         ...(meta.context ? { context: meta.context } : {}),
         ...(meta.location ? { location: meta.location } : {}),
-        ...(meta.voice_data ? { voice_data: meta.voice_data } : {}),
+        ...(meta.voice_data ? { voice_data: JSON.stringify(meta.voice_data) } : {}),
         ...(meta.thinking ? { thinking: meta.thinking } : {}),
-        ...(meta.timeout_ms ? { timeout_ms: meta.timeout_ms } : {}),
+        ...(meta.timeout_ms ? { timeout_ms: String(meta.timeout_ms) } : {}),
       },
     },
+  }).catch(err => {
+    process.stderr.write(`clawvibe: notification failed: ${err}\n`)
   })
 }
 
@@ -386,14 +388,23 @@ function pruneActiveRuns(): void {
 // ── Broadcast helpers ───────────────────────────────────────────────────────
 
 function sendFrame(ws: ServerWebSocket<WSData>, frame: ResponseFrame | EventFrame): void {
-  if (ws.readyState === 1) ws.send(JSON.stringify(frame))
+  try {
+    if (ws.readyState === 1) ws.send(JSON.stringify(frame))
+  } catch (err) {
+    process.stderr.write(`clawvibe: sendFrame failed: ${err}\n`)
+  }
 }
 
 function broadcastEvent(frame: EventFrame, targetDeviceId?: string): void {
   let sent = 0, skipped = 0
+  let payload: string
+  try { payload = JSON.stringify(frame) } catch (err) {
+    process.stderr.write(`clawvibe: broadcastEvent serialize failed: ${err}\n`)
+    return
+  }
   const send = (ws: ServerWebSocket<WSData>) => {
     if (!ws.data.authenticated) { skipped++; return }
-    if (ws.readyState === 1) { ws.send(JSON.stringify(frame)); sent++ }
+    if (ws.readyState === 1) { ws.send(payload); sent++ }
     else { skipped++ }
   }
   if (targetDeviceId) clients.get(targetDeviceId)?.forEach(send)
