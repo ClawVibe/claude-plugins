@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# clawvibe — CLI for the ClawVibe channel plugin.
+# Installed to PATH inside the ClawCode container.
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+PLUGIN_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+usage() {
+  cat <<EOF
+clawvibe — ClawVibe channel plugin CLI
+
+usage: clawvibe <command>
+
+commands:
+  qr [--text] [--no-wait]   Generate a pairing QR code and wait for device to connect.
+  help                       This message.
+EOF
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  qr)
+    exec python3 "$PLUGIN_DIR/qr.py" "$@"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "unknown command: $cmd" >&2
+    usage
+    exit 1
+    ;;
+esac
