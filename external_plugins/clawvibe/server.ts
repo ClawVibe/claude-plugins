@@ -291,6 +291,8 @@ type InboundMeta = {
   context?: string
   location?: string
   voice_data?: unknown
+  thinking?: string
+  timeout_ms?: number
 }
 
 function deliverInbound(text: string, meta: InboundMeta): void {
@@ -309,6 +311,8 @@ function deliverInbound(text: string, meta: InboundMeta): void {
         ...(meta.context ? { context: meta.context } : {}),
         ...(meta.location ? { location: meta.location } : {}),
         ...(meta.voice_data ? { voice_data: meta.voice_data } : {}),
+        ...(meta.thinking ? { thinking: meta.thinking } : {}),
+        ...(meta.timeout_ms ? { timeout_ms: meta.timeout_ms } : {}),
       },
     },
   })
@@ -583,6 +587,8 @@ function handleChatSend(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   const sessionKey = (params.sessionKey as string) ?? `device:${ws.data.device_id}`
   const message = (params.message as string) ?? ''
   const idempotencyKey = (params.idempotencyKey as string) ?? ''
+  const thinking = params.thinking as string | undefined
+  const timeoutMs = typeof params.timeoutMs === 'number' ? params.timeoutMs : undefined
 
   const runId = nextMsgId()
   const conversationId = sessionKey
@@ -614,6 +620,8 @@ function handleChatSend(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
     context,
     location,
     voice_data: voiceData,
+    thinking,
+    timeout_ms: timeoutMs,
   })
 
   // Respond with the runId so iOS can correlate events
@@ -653,6 +661,30 @@ function handleAgentsList(ws: ServerWebSocket<WSData>, req: RequestFrame): void 
   sendFrame(ws, { type: 'res', id: req.id, ok: true, payload: result })
 }
 
+function handleAgentIdentityGet(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
+  const params = req.params ?? {}
+  const agentId = (params.agentId as string) ?? 'default'
+
+  let agents: Array<{ id: string; name: string; emoji?: string }> = []
+  try {
+    const raw = readFileSync(join(STATE_DIR, 'agents.json'), 'utf8')
+    agents = JSON.parse(raw) as typeof agents
+  } catch {}
+
+  const agent = agents.find(a => a.id === agentId)
+  if (!agent) {
+    sendFrame(ws, { type: 'res', id: req.id, ok: false, error: { message: `agent not found: ${agentId}` } })
+    return
+  }
+
+  sendFrame(ws, {
+    type: 'res',
+    id: req.id,
+    ok: true,
+    payload: { agentId: agent.id, name: agent.name, avatar: null, emoji: agent.emoji ?? null },
+  })
+}
+
 function handleRPC(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   switch (req.method) {
     case 'connect':
@@ -666,6 +698,9 @@ function handleRPC(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
       return
     case 'agents.list':
       handleAgentsList(ws, req)
+      return
+    case 'agent.identity.get':
+      handleAgentIdentityGet(ws, req)
       return
     default:
       sendFrame(ws, {
