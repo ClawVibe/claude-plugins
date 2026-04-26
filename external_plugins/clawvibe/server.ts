@@ -43,6 +43,8 @@ const PID_FILE = join(STATE_DIR, 'server.pid')
 const PORT = Number(process.env.CLAWVIBE_PORT ?? 8791)
 const HOSTNAME = process.env.CLAWVIBE_HOSTNAME ?? '127.0.0.1'
 const TICK_INTERVAL_MS = 30_000
+const HANDSHAKE_TIMEOUT_MS = 10_000
+const ACTIVE_RUN_TTL_MS = 5 * 60 * 1000
 const startedAt = Date.now()
 
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
@@ -64,6 +66,20 @@ process.on('unhandledRejection', err => {
 })
 process.on('uncaughtException', err => {
   process.stderr.write(`clawvibe: uncaught exception: ${err}\n`)
+})
+
+// Exit when the parent process (Claude Code) dies — stdin pipe closes.
+// Without this, Bun.serve() keeps the event loop alive and the process
+// becomes an orphan holding the port.
+process.stdin.on('end', () => {
+  process.stderr.write('clawvibe: stdin closed (parent exited), shutting down\n')
+  try { rmSync(PID_FILE) } catch {}
+  process.exit(0)
+})
+process.stdin.on('error', () => {
+  process.stderr.write('clawvibe: stdin error (parent exited), shutting down\n')
+  try { rmSync(PID_FILE) } catch {}
+  process.exit(0)
 })
 
 // ── Access state ─────────────────────────────────────────────────────────────
@@ -238,7 +254,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const replyTo = args.reply_to as string | undefined
         const id = nextMsgId()
         // Find the active runId for this conversation to correlate the reply
-        const runId = activeRuns.get(conversationId) ?? id
+        const runId = activeRuns.get(conversationId)?.runId ?? id
         broadcastChatEvent(runId, conversationId, 'final', text)
         activeRuns.delete(conversationId)
         return { content: [{ type: 'text', text: `sent (${id})` }] }
@@ -333,8 +349,8 @@ type WSData = {
 }
 
 const clients = new Map<string, Set<ServerWebSocket<WSData>>>()
-// Track active run_id per conversation for reply correlation
-const activeRuns = new Map<string, string>()
+const handshakeTimers = new Map<ServerWebSocket<WSData>, Timer>()
+const activeRuns = new Map<string, { runId: string; ts: number }>()
 
 let msgSeq = 0
 let eventSeq = 0
@@ -343,6 +359,24 @@ function nextMsgId(): string {
 }
 function nextEventSeq(): number {
   return ++eventSeq
+}
+
+function reapDeadSockets(): void {
+  let reaped = 0
+  for (const [deviceId, set] of clients) {
+    for (const ws of set) {
+      if (ws.readyState !== 1) { set.delete(ws); reaped++ }
+    }
+    if (set.size === 0) clients.delete(deviceId)
+  }
+  if (reaped > 0) process.stderr.write(`clawvibe: reaped ${reaped} dead socket(s)\n`)
+}
+
+function pruneActiveRuns(): void {
+  const now = Date.now()
+  for (const [k, v] of activeRuns) {
+    if (now - v.ts > ACTIVE_RUN_TTL_MS) activeRuns.delete(k)
+  }
 }
 
 // ── Broadcast helpers ───────────────────────────────────────────────────────
@@ -397,8 +431,10 @@ function broadcastChatEvent(
   })
 }
 
-// 30s tick keepalive in OpenClaw EventFrame format
+// 30s tick keepalive + dead socket reaper + activeRuns pruner
 setInterval(() => {
+  reapDeadSockets()
+  pruneActiveRuns()
   broadcastEvent({
     type: 'event',
     event: 'tick',
@@ -479,12 +515,25 @@ function handleConnect(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
     return
   }
 
-  // Authenticate the socket
+  // Authenticate the socket — clear handshake timeout
+  const timer = handshakeTimers.get(ws)
+  if (timer) { clearTimeout(timer); handshakeTimers.delete(ws) }
   ws.data.device_id = device.device_id
   ws.data.device_name = device.device_name
   ws.data.authenticated = true
 
-  // Register in clients map
+  // Evict stale sockets for this device (previous connection didn't close cleanly)
+  const existing = clients.get(device.device_id)
+  if (existing) {
+    for (const old of existing) {
+      if (old !== ws) {
+        process.stderr.write(`clawvibe: evicting stale socket for device=${device.device_id}\n`)
+        try { old.close(4000, 'replaced by new connection') } catch {}
+        existing.delete(old)
+      }
+    }
+  }
+
   let set = clients.get(device.device_id)
   if (!set) { set = new Set(); clients.set(device.device_id, set) }
   set.add(ws)
@@ -538,8 +587,7 @@ function handleChatSend(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   const runId = nextMsgId()
   const conversationId = sessionKey
 
-  // Track for reply correlation
-  activeRuns.set(conversationId, runId)
+  activeRuns.set(conversationId, { runId, ts: Date.now() })
 
   // Parse sensory tags from the message (iOS embeds them inline)
   let context: string | undefined
@@ -663,7 +711,7 @@ function handleLegacyFrame(ws: ServerWebSocket<WSData>, frame: LegacyInFrame): v
       if (frame.tags?.voice_data) parts.push(`[VOICE_DATA: ${JSON.stringify(frame.tags.voice_data)}]`)
       const runId = frame.run_id
       const conversationId = frame.conversation_id || 'default'
-      activeRuns.set(conversationId, runId)
+      activeRuns.set(conversationId, { runId, ts: Date.now() })
       deliverInbound(parts.join('\n'), {
         device_id: ws.data.device_id,
         device_name: ws.data.device_name,
@@ -824,12 +872,27 @@ Bun.serve<WSData>({
           stateVersion: null,
         }
         sendFrame(ws, challenge)
+        // Close unauthenticated sockets that don't complete the handshake
+        const timer = setTimeout(() => {
+          handshakeTimers.delete(ws)
+          if (!ws.data.authenticated && ws.readyState === 1) {
+            process.stderr.write('clawvibe: handshake timeout, closing socket\n')
+            ws.close(4001, 'handshake timeout')
+          }
+        }, HANDSHAKE_TIMEOUT_MS)
+        handshakeTimers.set(ws, timer)
         process.stderr.write(`clawvibe: ws open (gateway) — sent challenge\n`)
       }
     },
     close(ws, code, reason) {
+      const timer = handshakeTimers.get(ws)
+      if (timer) { clearTimeout(timer); handshakeTimers.delete(ws) }
       if (ws.data.device_id) {
-        clients.get(ws.data.device_id)?.delete(ws)
+        const set = clients.get(ws.data.device_id)
+        if (set) {
+          set.delete(ws)
+          if (set.size === 0) clients.delete(ws.data.device_id)
+        }
       }
       process.stderr.write(`clawvibe: ws close device=${ws.data.device_id || '(unauthenticated)'} code=${code}\n`)
     },
