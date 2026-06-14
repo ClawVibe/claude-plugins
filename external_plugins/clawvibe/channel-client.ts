@@ -13,6 +13,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { existsSync } from 'fs'
 import { join } from 'path'
 import type { Socket } from 'bun'
 
@@ -31,7 +32,12 @@ import {
 const EXPLICIT_AGENT = process.env.CLAUDE_CODE_AGENT || process.env.CLAWVIBE_AGENT_ID || ''
 const AGENT_ID = EXPLICIT_AGENT || 'default'
 const IDENTITY: AgentIdentity = loadAgentIdentity(AGENT_ID)
-const DAEMON_PATH = join(import.meta.dir, 'gateway-daemon.ts')
+// Resolve the daemon next to the running file — `.js` when bundled into dist/,
+// `.ts` when running from source.
+const DAEMON_PATH =
+  ['gateway-daemon.js', 'gateway-daemon.ts']
+    .map(f => join(import.meta.dir, f))
+    .find(existsSync) ?? join(import.meta.dir, 'gateway-daemon.ts')
 
 ensureStateDirs()
 

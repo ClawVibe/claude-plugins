@@ -11,14 +11,40 @@ Works on any Claude Code instance — ClawCode users and generic users alike —
 
 The iOS app picks an agent and encodes it in the routing key `sessionKey = "agent:<agentId>:clawvibe:app:<deviceId>"`; the daemon routes to that agent and returns its reply to only the originating device.
 
-## Install
+## Install (new machine)
 
 ```
-/plugin install clawvibe@clawvibe-plugins
-claude --channels plugin:clawvibe@clawvibe-plugins --agent <name>
+/plugin install clawvibe@clawvibe-plugins      # in Claude Code
+clawvibe setup                                  # bundle check, CLI link, Tailscale check, start agents
+clawvibe agent add <id> --emoji 🤖              # define + configure an agent (repeat per agent)
+clawvibe agents up                              # start them (idempotent)
+clawvibe qr                                      # pair your iOS device
+clawvibe install-service                         # (optional) persist across reboot
 ```
 
-Requires [Bun](https://bun.sh) and the plugin's dependencies — run `bun install` in the plugin directory (a `bun.lock` is committed). A fresh install with no `node_modules` makes the MCP server fail to start.
+Requires [Bun](https://bun.sh) as the runtime. **Dependencies are bundled** — the committed `dist/` is self-contained (the MCP SDK is inlined), so no `bun install` is needed at runtime. `clawvibe setup` symlinks the CLI to `~/.local/bin/clawvibe` (ensure that's on your `PATH`) and reports whether the Tailscale ingress is correctly configured (see Deployment).
+
+## Managing agents
+
+Agents are declarative: `clawvibe agent add <id>` writes `~/.claude/agents/<id>.md` (its name/emoji/persona) and records the id in `$CLAWVIBE_STATE_DIR/managed-agents.json`. `clawvibe agents up` starts a background channel session per configured agent (idempotent — skips ones already running); each registers with the shared daemon and appears in the app's picker.
+
+```
+clawvibe agent add patrick --emoji ⭐ [--model <m>] [--prompt "<persona>"]
+clawvibe agent list                  # configured agents + running/registered status
+clawvibe agents up | down            # start all / stop all
+clawvibe agent rm <id> [--purge]     # unconfigure (--purge also deletes the def)
+```
+
+`clawvibe install-service` writes a `systemd --user` unit (`clawvibe-agents.service`) that runs `clawvibe agents up` at login/boot. For start-at-boot without an active login, run `sudo loginctl enable-linger $USER`. (Linux/systemd; macOS launchd is a follow-up.) Claude Code must be authenticated for the user the unit runs as.
+
+### Manual launch (equivalent of one `agents up` entry)
+
+```
+claude --bg --channels plugin:clawvibe@clawvibe-plugins --agent <id> \
+  --permission-mode acceptEdits \
+  --allowed-tools mcp__plugin_clawvibe_clawvibe__reply mcp__plugin_clawvibe_clawvibe__edit_message \
+  --name clawvibe-<id> "<seed prompt>"
+```
 
 ## Configuration
 

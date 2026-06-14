@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # clawvibe — CLI for the ClawVibe channel plugin.
-# Installed to PATH inside the ClawCode container.
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -12,9 +11,17 @@ clawvibe — ClawVibe channel plugin CLI
 
 usage: clawvibe <command>
 
-commands:
-  qr [--text] [--no-wait]   Generate a pairing QR code and wait for device to connect.
-  help                       This message.
+  setup [--apply-tailscale]      One-shot install: bundle, CLI link, Tailscale
+                                 ingress check, start configured agents.
+  agent add <id> [--emoji E] [--model M] [--prompt P]
+                                 Define + configure a channel agent.
+  agent rm <id> [--purge]        Unconfigure an agent (--purge deletes its def).
+  agent list                     Show configured agents and their status.
+  agents up                      Start every configured agent (idempotent).
+  agents down                    Stop all clawvibe-* agent sessions.
+  install-service                systemd --user unit that runs 'agents up' at login/boot.
+  qr [--text] [--no-wait]        Generate a pairing QR code.
+  help                           This message.
 EOF
 }
 
@@ -24,6 +31,9 @@ shift || true
 case "$cmd" in
   qr)
     exec python3 "$PLUGIN_DIR/qr.py" "$@"
+    ;;
+  setup|install-service|agent|agents)
+    exec bun "$PLUGIN_DIR/cli.ts" "$cmd" "$@"
     ;;
   help|-h|--help)
     usage

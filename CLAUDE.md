@@ -17,12 +17,12 @@ clawvibe-plugin/                    # marketplace repo root
 ├── external_plugins/clawvibe/      # the actual plugin
 │   ├── gateway-daemon.ts           # shared HTTP/WS gateway daemon (Bun): owns :8791, pairing, agent registry, IPC server
 │   ├── channel-client.ts           # per-session MCP server (`start`): connects to daemon over IPC, registers its agent
-│   ├── shared/protocol.ts          # wire + IPC types, sessionKey parser, NDJSON framing
-│   ├── shared/access.ts            # config paths + access.json/pairing/bootstrap (daemon-only)
-│   ├── shared/identity.ts          # loadAgentIdentity() from ~/.claude/agents/<id>.md frontmatter
+│   ├── cli.ts                      # automation CLI: setup / agent add|rm|list / agents up|down / install-service
+│   ├── shared/{protocol,access,identity}.ts  # wire+IPC types & sessionKey parser; config+pairing; agent identity
+│   ├── dist/                       # COMMITTED self-contained bundle (sdk inlined) — what `start`/daemon run
 │   ├── qr.py                       # QR code generator + interactive pairing tool (hits daemon HTTP)
-│   ├── bin/clawvibe                # CLI wrapper (installed to /usr/local/bin in container)
-│   ├── package.json                # clawvibe-channel; start→channel-client.ts, daemon→gateway-daemon.ts
+│   ├── bin/clawvibe                # CLI dispatcher (qr→qr.py; setup/agent/agents/install-service→cli.ts)
+│   ├── package.json                # build→dist; start→dist/channel-client.js; daemon→dist/gateway-daemon.js
 │   └── README.md
 ├── package.json                    # marketplace-level
 └── README.md
@@ -98,7 +98,7 @@ clawcode qr              # runs clawvibe qr inside the container
   ```
   Inside the container this is avoided by running Tailscale in-container; on a host gateway use the TCP-forward form above.
 - **`CLAWVIBE_HOSTNAME` must be `127.0.0.1`**, not `0.0.0.0`. Tailscale serve binds the Tailscale IP on the plugin port; `0.0.0.0` conflicts. The supervisor sets this in the subprocess env.
-- **Dependencies must be installed in the plugin dir/cache.** `channel-client.ts`/`gateway-daemon.ts` import `@modelcontextprotocol/sdk` from `node_modules`; a fresh marketplace install with no `node_modules` makes the MCP server report `status: "failed"` (channel banner shows, but no gateway). Run `bun install` in the plugin dir; `bun.lock` is committed so it's reproducible.
+- **Deps are bundled — run `bun run build` after changing source.** `start`/`daemon` run the committed `dist/*.js`, which inline `@modelcontextprotocol/sdk` (self-contained, so a fresh marketplace install needs no `node_modules`). The `dist/` artifacts are committed and **must be rebuilt** (`bun run build`) and re-committed whenever `channel-client.ts`/`gateway-daemon.ts`/`shared/*` change, or the deployed plugin runs stale code. (Historically, a fresh install with no `node_modules` made the MCP server report `status: "failed"` — bundling fixes that.)
 - **Multi-server token collision (re-auth).** The iOS app stores its device token per *(device, role)*, not per server — so two `operator` servers (e.g. this host gateway + the container SpongeBob) clobber each other's token, and on switch-back the app falls through to its one-time setup/bootstrap token. The daemon therefore **re-authenticates a device from an already-used setup code** (paired bootstrap tokens are kept, not pruned) and re-hands the device token in HelloOk. Without this, reconnect after a server switch gets stuck on "authenticating".
 
 ## Reconnection
@@ -119,10 +119,24 @@ Process lifecycle (split model):
 ## Development
 
 ```bash
-# Install deps (inside the plugin dir)
-cd external_plugins/clawvibe && bun install
+cd external_plugins/clawvibe
+bun install            # dev only (for typecheck/source runs); runtime uses the bundle
+bun run build          # rebuild dist/ — REQUIRED after editing client/daemon/shared, then commit dist/
 
 # The plugin is bind-mounted into ubuntu-clawcode at /opt/clawvibe-plugin
 # Changes are picked up on restart:
 clawcode restart spongebob
 ```
+
+### Turnkey install / agent management (CLI)
+
+```bash
+clawvibe setup [--apply-tailscale]   # bundle check, link ~/.local/bin/clawvibe, Tailscale check, agents up
+clawvibe agent add <id> --emoji 🤖   # writes ~/.claude/agents/<id>.md + managed-agents.json
+clawvibe agents up | down            # start (idempotent) / stop all clawvibe-* sessions
+clawvibe agent list                  # configured + running/registered status
+clawvibe install-service             # systemd --user unit running `agents up` at login/boot
+```
+
+- Managed-agent config: `$CLAWVIBE_STATE_DIR/managed-agents.json` (`[{id, model?}]`). Identity/persona come from `~/.claude/agents/<id>.md`.
+- `agents up` launches each as `claude --bg --channels … --agent <id> --permission-mode acceptEdits --allowed-tools <reply tools> --name clawvibe-<id>`, **from `$HOME`** (a trusted dir — otherwise the bg session blocks on a directory-trust prompt). The first launch auto-spawns the daemon (detached via `setsid`, so it survives agent restarts).
