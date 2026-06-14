@@ -1,49 +1,66 @@
 # ClawVibe channel for Claude Code
 
-Pair a [ClawVibe](https://www.clawvibe.app) iOS device with any Claude Code session. The device talks to this plugin over a WebSocket; the plugin forwards each message into the Claude session as a channel notification, and the agent replies through the `reply` tool.
+Pair a [ClawVibe](https://www.clawvibe.app) iOS device with Claude Code. The device talks to a shared **gateway daemon** over a WebSocket (OpenClaw gateway wire protocol); the daemon routes each message to the selected agent's session as a channel notification, and the agent replies through the `reply` tool.
 
-Works on any Claude Code instance — ClawCode users and generic users alike.
+Works on any Claude Code instance — ClawCode users and generic users alike — and supports **multiple agents over one connection**.
+
+## Architecture
+
+- **Gateway daemon** (`gateway-daemon.ts`): one long-lived, detached singleton per machine. Owns the HTTP/WS port (`:8791`), device pairing/`access.json`, and a dynamic registry of connected agents. Auto-spawned by the first agent's channel client (via `setsid`) and lingers so pairing keeps working.
+- **Channel client** (`channel-client.ts`): the per-session MCP server loaded via `--channels`. Connects to the daemon over a Unix socket, registers its agent (id from `CLAUDE_CODE_AGENT`, identity from `~/.claude/agents/<id>.md`), relays inbound messages, and sends replies.
+
+The iOS app picks an agent and encodes it in the routing key `sessionKey = "agent:<agentId>:clawvibe:app:<deviceId>"`; the daemon routes to that agent and returns its reply to only the originating device.
 
 ## Install
 
 ```
-/plugin install clawvibe@claude-plugins-official
-claude --channels plugin:clawvibe@claude-plugins-official
+/plugin install clawvibe@clawvibe-plugins
+claude --channels plugin:clawvibe@clawvibe-plugins --agent <name>
 ```
+
+Requires [Bun](https://bun.sh) and the plugin's dependencies — run `bun install` in the plugin directory (a `bun.lock` is committed). A fresh install with no `node_modules` makes the MCP server fail to start.
 
 ## Configuration
 
 - `CLAWVIBE_PORT` — HTTP/WS port (default `8791`).
-- `CLAWVIBE_HOSTNAME` — bind host (default `127.0.0.1`). Expose to the public internet via a reverse proxy or Tailscale serve; do not bind `0.0.0.0` unless you know what you're doing.
+- `CLAWVIBE_HOSTNAME` — bind host (default `127.0.0.1`). Do **not** bind `0.0.0.0`; expose over the tailnet via Tailscale Serve (below).
 - `CLAWVIBE_STATE_DIR` — state path (default `~/.claude/channels/clawvibe/`).
+- `CLAWVIBE_AGENT_ID` / `CLAWVIBE_AGENT_NAME` / `CLAWVIBE_AGENT_EMOJI` — override the agent id/identity when `CLAUDE_CODE_AGENT` isn't set.
 
-## Pairing flow
+### Deployment: expose over Tailscale (important)
 
-1. User opens ClawVibe iOS app, taps "Pair ClawVibe channel", scans the QR code you show them.
-2. iOS hits `POST /pair/request` with `{device_id, device_name}`; server generates a 5-letter code and prints it to stderr.
-3. You run `/clawvibe:access pair <code>` in the Claude session to approve.
-4. iOS polls `GET /pair/status?device_id=…` and receives a long-lived `device_token`.
-5. iOS opens `GET /ws?device_token=…` and the chat is live.
+The gateway speaks plain HTTP/1.1; the device connects with `wss://`. Terminate TLS in front of it. **It must be a TLS-terminated TCP forward, not an HTTPS web proxy** — a `tailscale serve --https` proxy serves over HTTP/2, which breaks WebSocket upgrades (symptom: the WS connects, runs a few RPCs, then drops with **code 1006** in a loop; local `127.0.0.1` connections are unaffected).
 
-## Wire protocol (device ↔ server)
-
-Client → server frames:
-
-```json
-{"type":"chat.send", "run_id":"…", "conversation_id":"…", "text":"…",
- "tags":{"context":"…", "location":"…", "voice_data":[…]}}
-{"type":"chat.abort", "run_id":"…"}
-{"type":"ping"}
+```bash
+sudo tailscale serve --https=8791 off                              # if a web proxy was set
+sudo tailscale serve --bg --tls-terminated-tcp=8791 tcp://localhost:8791
 ```
 
-Server → client frames:
+`tailscale serve status` should show `:8791` as a TCP forward (TLS terminated), not a `/ proxy` web handler. Inside the OpenClaw/ClawCode container this is avoided by running Tailscale in-container; on a host gateway use the form above. Any TLS-terminating TCP proxy that preserves HTTP/1.1 (nginx/Caddy stream, Cloudflare Tunnel, etc.) works equally.
 
-```json
-{"type":"message.final", "message_id":"…", "conversation_id":"…", "text":"…", "ts":…}
-{"type":"message.edit",  "message_id":"…", "text":"…", "ts":…}
-{"type":"pong"}
-{"type":"tick", "ts":…}
-```
+## Pairing
+
+**QR / bootstrap (primary)** — use the `connect` skill, or run `clawvibe qr`:
+
+1. `clawvibe qr` mints a one-time bootstrap token and renders a QR encoding `{url, bootstrapToken, kind: "clawvibe"}`. Show it to the user (the `connect` skill renders the ASCII QR directly in chat). `clawvibe qr --text` prints the setup code for manual entry.
+2. The user scans it in the ClawVibe iOS app. The server validates the bootstrap token, **auto-approves**, and issues a long-lived device token in the `HelloOk` response — no separate approval step.
+3. On reconnect the app presents the device token. If it falls back to the (already-used) setup code — e.g. after switching servers — the daemon **re-authenticates** the device that code originally paired and re-hands the device token.
+
+**Legacy pairing code (secondary)** — `POST /pair/request` → 5-letter code → approve with `/clawvibe:access pair <code>` → `GET /pair/status` returns the device token.
+
+Manage devices with the **`access`** skill (list / revoke / set policy).
+
+## Wire protocol (device ↔ gateway)
+
+Speaks the **OpenClaw gateway protocol** over a WebSocket at `/`:
+
+1. On connect the server sends a `connect.challenge` event.
+2. The client sends a `connect` RPC with `auth.token` (device token) or `auth.bootstrapToken`; the server replies `HelloOk` (protocol 3) including the issued `deviceToken`.
+3. `chat.send` (with `sessionKey`, `message`, …) → server returns `{runId}`; inbound device messages are delivered to the selected agent.
+4. The agent's reply comes back as `chat` events (`state: delta|final|error|aborted`) echoing the same `runId`/`sessionKey`, delivered only to the originating device.
+5. `agents.list` / `agent.identity.get` for the agent picker; `health`; `tick` keepalive every 30s.
+
+A legacy frame format (`{type:"chat.send"|"chat.abort"|"ping"}` over `/ws?device_token=…`) is still accepted for backward compatibility.
 
 Message text may contain format directives the ClawVibe client understands:
 
@@ -53,6 +70,7 @@ Message text may contain format directives the ClawVibe client understands:
 
 ## Security
 
-- Device token is the only credential on `/ws`; leaking it gives full channel access until revoked (`/clawvibe:access revoke <device_id>`).
-- No TLS here — deploy behind a proxy that terminates TLS (nginx, Caddy, Tailscale serve, Cloudflare Tunnel, etc.).
-- Pairing codes expire 10 minutes after issuance.
+- The device token is a bearer credential; leaking it gives channel access until revoked (`/clawvibe:access revoke <device_id>`). A paired setup/bootstrap token is likewise retained and re-authenticates its device.
+- No TLS in the gateway itself — deploy behind a TLS-terminating TCP proxy (see Deployment).
+- Bootstrap tokens expire 10 minutes after issuance (for fresh pairing); once a token has paired a device it is retained to support reconnect re-auth.
+- A session that merely has the plugin enabled (no `--agent` / `CLAWVIBE_AGENT_ID`) stays inert and does not register as an agent.
