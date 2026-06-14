@@ -15,10 +15,14 @@ This repo is a **Claude Code plugin marketplace** (not just a plugin). Structure
 ```
 clawvibe-plugin/                    # marketplace repo root
 ├── external_plugins/clawvibe/      # the actual plugin
-│   ├── server.ts                   # MCP server + HTTP/WS gateway server (Bun)
-│   ├── qr.py                       # QR code generator + interactive pairing tool
+│   ├── gateway-daemon.ts           # shared HTTP/WS gateway daemon (Bun): owns :8791, pairing, agent registry, IPC server
+│   ├── channel-client.ts           # per-session MCP server (`start`): connects to daemon over IPC, registers its agent
+│   ├── shared/protocol.ts          # wire + IPC types, sessionKey parser, NDJSON framing
+│   ├── shared/access.ts            # config paths + access.json/pairing/bootstrap (daemon-only)
+│   ├── shared/identity.ts          # loadAgentIdentity() from ~/.claude/agents/<id>.md frontmatter
+│   ├── qr.py                       # QR code generator + interactive pairing tool (hits daemon HTTP)
 │   ├── bin/clawvibe                # CLI wrapper (installed to /usr/local/bin in container)
-│   ├── package.json                # clawvibe-channel, deps: @modelcontextprotocol/sdk
+│   ├── package.json                # clawvibe-channel; start→channel-client.ts, daemon→gateway-daemon.ts
 │   └── README.md
 ├── package.json                    # marketplace-level
 └── README.md
@@ -37,6 +41,14 @@ ClawCode's daemon spawns SpongeBob with:
 ```
 
 The plugin runs as an MCP subprocess inside the `ubuntu-clawcode` container. iOS app messages arrive via the gateway WebSocket, get delivered as `notifications/claude/channel` to Claude Code, and become conversation turns for SpongeBob.
+
+## Architecture: shared gateway + thin clients (multi-agent)
+
+The gateway is **decoupled from the agent sessions**. One long-lived **gateway daemon** owns `:8791` + pairing + device WebSockets + a dynamic agent registry. Each Claude session launches a thin **channel client** (`bun channel-client.ts`, via `--channels`) that connects to the daemon over a Unix socket (`$CLAWVIBE_STATE_DIR/gateway.sock`), auto-spawning the daemon if absent (singleton-guarded), and registers its agent (`CLAUDE_CODE_AGENT`, identity from `~/.claude/agents/<id>.md`).
+
+**Routing:** the iOS app encodes the target agent in `sessionKey = "agent:<agentId>:clawvibe:app:<deviceId>"`. The daemon parses `<agentId>` from `chat.send`, forwards the message over IPC to that agent's client (which injects it as a turn), and routes the client's `reply` back to **only** the originating device socket, echoing the same `runId`/`sessionKey` with an incrementing `seq`. `agents.list`/`agent.identity.get` are served from the live registry. Multiple agents share the one gateway/port — this is why several agent sessions can run at once (the old monolithic `server.ts` bound `:8791` per-session, which raced and orphaned).
+
+This fixes the historical fixed-port races/zombies: a redundant daemon `exit(0)`s on `EADDRINUSE` (no zombie), the daemon **lingers** when agents disconnect (pairing keeps working), and only the daemon writes `access.json` (single writer).
 
 ## Gateway Wire Protocol
 
