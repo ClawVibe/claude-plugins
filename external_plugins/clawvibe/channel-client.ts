@@ -23,7 +23,13 @@ import {
   type IpcFrame, type IpcInbound, type InboundMeta, type AgentIdentity,
 } from './shared/protocol.ts'
 
-const AGENT_ID = process.env.CLAUDE_CODE_AGENT || process.env.CLAWVIBE_AGENT_ID || 'default'
+// A session only acts as a channel agent when it was launched for a specific
+// agent (--agent → CLAUDE_CODE_AGENT, or an explicit CLAWVIBE_AGENT_ID). A
+// session that merely has the plugin enabled (e.g. a dev session) has neither,
+// so it stays inert instead of registering a bogus "default" agent that would
+// pollute the picker and fight other such sessions for the "default" id.
+const EXPLICIT_AGENT = process.env.CLAUDE_CODE_AGENT || process.env.CLAWVIBE_AGENT_ID || ''
+const AGENT_ID = EXPLICIT_AGENT || 'default'
 const IDENTITY: AgentIdentity = loadAgentIdentity(AGENT_ID)
 const DAEMON_PATH = join(import.meta.dir, 'gateway-daemon.ts')
 
@@ -160,17 +166,23 @@ function sendIpc(frame: IpcFrame): void {
 }
 
 function spawnDaemon(): void {
-  try {
-    const proc = Bun.spawn({
-      cmd: [process.execPath, DAEMON_PATH],
-      stdio: ['ignore', 'ignore', 'inherit'],
-      env: process.env,
-      // Detach so the daemon outlives this session (it is shared).
-    })
-    proc.unref()
-    process.stderr.write(`clawvibe-client: spawned gateway daemon pid=${proc.pid}\n`)
-  } catch (err) {
-    process.stderr.write(`clawvibe-client: failed to spawn daemon: ${err}\n`)
+  // Launch via `setsid` so the daemon runs in its own session, fully detached
+  // from this client's process tree. Otherwise the daemon dies/destabilises when
+  // the spawning agent session restarts (it is a SHARED, long-lived process).
+  // Falls back to a plain detached spawn if `setsid` is unavailable.
+  const attempts: string[][] = [
+    ['setsid', process.execPath, DAEMON_PATH],
+    [process.execPath, DAEMON_PATH],
+  ]
+  for (const cmd of attempts) {
+    try {
+      const proc = Bun.spawn({ cmd, stdio: ['ignore', 'ignore', 'ignore'], env: process.env })
+      proc.unref()
+      process.stderr.write(`clawvibe-client: spawned gateway daemon (${cmd[0]}) pid=${proc.pid}\n`)
+      return
+    } catch (err) {
+      process.stderr.write(`clawvibe-client: spawn via ${cmd[0]} failed: ${err}\n`)
+    }
   }
 }
 
@@ -225,6 +237,10 @@ process.on('unhandledRejection', err => process.stderr.write(`clawvibe-client: u
 
 // ── Start ──────────────────────────────────────────────────────────────────────
 
-await connectDaemon()
+if (EXPLICIT_AGENT) {
+  await connectDaemon()
+} else {
+  process.stderr.write('clawvibe-client: no agent id (CLAUDE_CODE_AGENT/CLAWVIBE_AGENT_ID unset) — running inert, not joining the gateway\n')
+}
 await mcp.connect(new StdioServerTransport())
 process.stderr.write(`clawvibe-client: MCP transport connected (state ${STATE_DIR})\n`)
