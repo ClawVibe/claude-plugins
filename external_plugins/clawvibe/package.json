@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun channel-client.ts",
-    "daemon": "bun gateway-daemon.ts"
+    "build": "bun build channel-client.ts gateway-daemon.ts --target bun --outdir dist",
+    "start": "bun dist/channel-client.js",
+    "daemon": "bun dist/gateway-daemon.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
