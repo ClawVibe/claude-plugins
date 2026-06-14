@@ -107,9 +107,11 @@ export function newBootstrapToken(): { token: string; expiresAt: number } {
   const expiresAt = Date.now() + 10 * 60 * 1000
   const a = readAccess()
   if (!a.bootstrapTokens) a.bootstrapTokens = {}
-  // Prune expired tokens
+  // Prune expired tokens — but KEEP ones that already paired a device: the iOS
+  // app re-presents its setup code on reconnect, and we re-auth that device from
+  // this record (see gateway-daemon handleConnect).
   for (const [k, v] of Object.entries(a.bootstrapTokens)) {
-    if (v.expires_at < Date.now()) delete a.bootstrapTokens[k]
+    if (v.expires_at < Date.now() && !v.paired_device_id) delete a.bootstrapTokens[k]
   }
   a.bootstrapTokens[token] = { created_at: Date.now(), expires_at: expiresAt, used: false }
   writeAccess(a)

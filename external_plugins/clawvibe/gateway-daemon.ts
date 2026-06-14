@@ -286,38 +286,56 @@ function handleConnect(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   const token = (auth?.token as string) ?? ''
   const bootstrapToken = (auth?.bootstrapToken as string) ?? ''
 
+  process.stderr.write(
+    `clawvibe-daemon: connect auth=[${Object.keys(auth ?? {}).join(',') || 'none'}]\n`,
+  )
+
   let device: ApprovedDevice | undefined
 
   if (bootstrapToken) {
-    if (!consumeBootstrapToken(bootstrapToken)) {
-      sendFrame(ws, {
-        type: 'res', id: req.id, ok: false,
-        error: {
-          message: 'invalid or expired bootstrap token',
-          details: {
-            code: 'PAIRING_REQUIRED', reason: 'bootstrap-invalid', pauseReconnect: true,
-            userMessage: 'This pairing code has expired. Generate a new QR code and try again.',
+    if (consumeBootstrapToken(bootstrapToken)) {
+      // Fresh pairing: auto-approve this device and issue a device token.
+      const deviceField = params.device as Record<string, unknown> | undefined
+      const clientField = params.client as Record<string, unknown> | undefined
+      const deviceId = (deviceField?.deviceId as string) ?? `device-${randomBytes(8).toString('hex')}`
+      const deviceName = (clientField?.clientDisplayName as string) ?? 'ClawVibe device'
+      const deviceToken = newToken()
+      const a = readAccess()
+      a.approved[deviceId] = { device_id: deviceId, device_name: deviceName, token: deviceToken, approved_at: Date.now() }
+      if (a.bootstrapTokens?.[bootstrapToken]) {
+        a.bootstrapTokens[bootstrapToken].paired_device_id = deviceId
+        a.bootstrapTokens[bootstrapToken].paired_device_name = deviceName
+      }
+      writeAccess(a)
+      device = a.approved[deviceId]
+      process.stderr.write(`clawvibe-daemon: bootstrap paired device=${deviceId} name="${deviceName}"\n`)
+    } else {
+      // Already-used setup code: the iOS app re-presents it on reconnect (e.g.
+      // after switching servers) instead of the issued device token. Re-auth the
+      // device this code originally paired, and the HelloOk below re-hands it the
+      // device token. Only succeeds if that device is still approved.
+      const a = readAccess()
+      const bt = a.bootstrapTokens?.[bootstrapToken]
+      device = bt?.paired_device_id ? a.approved[bt.paired_device_id] : undefined
+      if (device) {
+        process.stderr.write(`clawvibe-daemon: bootstrap reused → re-auth device=${device.device_id}\n`)
+      } else {
+        sendFrame(ws, {
+          type: 'res', id: req.id, ok: false,
+          error: {
+            message: 'invalid or expired bootstrap token',
+            details: {
+              code: 'PAIRING_REQUIRED', reason: 'bootstrap-invalid', pauseReconnect: true,
+              userMessage: 'This pairing code has expired. Generate a new QR code and try again.',
+            },
           },
-        },
-      })
-      return
+        })
+        return
+      }
     }
-    const deviceField = params.device as Record<string, unknown> | undefined
-    const clientField = params.client as Record<string, unknown> | undefined
-    const deviceId = (deviceField?.deviceId as string) ?? `device-${randomBytes(8).toString('hex')}`
-    const deviceName = (clientField?.clientDisplayName as string) ?? 'ClawVibe device'
-    const deviceToken = newToken()
-    const a = readAccess()
-    a.approved[deviceId] = { device_id: deviceId, device_name: deviceName, token: deviceToken, approved_at: Date.now() }
-    if (a.bootstrapTokens?.[bootstrapToken]) {
-      a.bootstrapTokens[bootstrapToken].paired_device_id = deviceId
-      a.bootstrapTokens[bootstrapToken].paired_device_name = deviceName
-    }
-    writeAccess(a)
-    device = a.approved[deviceId]
-    process.stderr.write(`clawvibe-daemon: bootstrap paired device=${deviceId} name="${deviceName}"\n`)
   } else {
     device = tokenToDevice(token)
+    process.stderr.write(`clawvibe-daemon: token auth → ${device ? 'OK device=' + device.device_id : 'REJECTED (token not in access.json)'}\n`)
   }
 
   if (!device) {
