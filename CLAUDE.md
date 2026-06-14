@@ -91,17 +91,30 @@ clawcode qr              # runs clawvibe qr inside the container
 - **Blocked plugins fail silently.** They spawn, complete MCP handshake, then get terminated — no error in logs. Diagnostic: `server.pid` keeps rewriting with new PIDs but no `bun` process in `ps`.
 - **Dev testing bypass**: `--dangerously-load-development-channels plugin:clawvibe@clawvibe-plugins` skips the allowlist (still requires `channelsEnabled: true`).
 - **MCP tool names**: colons become underscores in permission rules. `plugin:clawvibe:clawvibe` → `mcp__plugin_clawvibe_clawvibe__<tool>`.
-- **Tailscale inside container**: WebSocket upgrades require HTTP/1.1. Host-side Tailscale Serve uses HTTP/2 which breaks WS upgrades. Tailscale must run inside the container (same as OpenClaw's setup).
+- **Tailscale Serve must be TLS-terminated TCP, NOT an HTTPS web proxy.** A `tailscale serve --https=8791` web proxy serves over **HTTP/2**, which breaks/destabilizes WebSocket upgrades — symptom: the WS connects, runs a few RPCs, then drops with **code 1006** in a reconnect loop (local `127.0.0.1` connections are fine; only the tailnet path drops). Fix — forward raw TCP so HTTP/1.1 is preserved end-to-end (TLS still terminated by Tailscale, so the app still uses `wss://`):
+  ```bash
+  sudo tailscale serve --https=8791 off
+  sudo tailscale serve --bg --tls-terminated-tcp=8791 tcp://localhost:8791
+  ```
+  Inside the container this is avoided by running Tailscale in-container; on a host gateway use the TCP-forward form above.
 - **`CLAWVIBE_HOSTNAME` must be `127.0.0.1`**, not `0.0.0.0`. Tailscale serve binds the Tailscale IP on the plugin port; `0.0.0.0` conflicts. The supervisor sets this in the subprocess env.
+- **Dependencies must be installed in the plugin dir/cache.** `channel-client.ts`/`gateway-daemon.ts` import `@modelcontextprotocol/sdk` from `node_modules`; a fresh marketplace install with no `node_modules` makes the MCP server report `status: "failed"` (channel banner shows, but no gateway). Run `bun install` in the plugin dir; `bun.lock` is committed so it's reproducible.
+- **Multi-server token collision (re-auth).** The iOS app stores its device token per *(device, role)*, not per server — so two `operator` servers (e.g. this host gateway + the container SpongeBob) clobber each other's token, and on switch-back the app falls through to its one-time setup/bootstrap token. The daemon therefore **re-authenticates a device from an already-used setup code** (paired bootstrap tokens are kept, not pruned) and re-hands the device token in HelloOk. Without this, reconnect after a server switch gets stuck on "authenticating".
 
 ## Reconnection
 
-The server handles iOS reconnection after network disruptions:
-- **Stdin close → exit**: prevents orphan bun processes holding the port when the parent (Claude Code) dies.
+The daemon handles iOS reconnection after network disruptions:
+- **Re-auth on reused setup code**: an already-used bootstrap token re-authenticates the device it originally paired (see the multi-server gotcha above).
 - **10s handshake timeout**: unauthenticated gateway sockets that don't complete `connect` within 10s get closed.
 - **Dead socket reaper**: runs every 30s in the tick interval, removes sockets with `readyState !== 1`.
 - **Stale socket eviction**: when the same `device_id` reconnects, old sockets are closed with code 4000.
-- **activeRuns TTL**: entries older than 5 minutes are pruned to prevent stale run tracking.
+- **activeRuns TTL**: entries older than 5 minutes are pruned; a pruned run emits a targeted `aborted` so the app isn't left spinning.
+
+Process lifecycle (split model):
+- **Daemon is a singleton and lingers**: a redundant daemon `exit(0)`s on `EADDRINUSE` (no zombie); the daemon stays up across agent connects/disconnects so pairing keeps working.
+- **Daemon detaches via `setsid`**: the auto-spawned daemon runs in its own session, independent of the spawning agent (so restarting an agent never destabilises the shared gateway).
+- **Client stdin close → exit**: the per-session `channel-client` (not the daemon) exits when its Claude session ends; it deregisters from the daemon.
+- **Inert without an agent**: a session with the plugin enabled but no `--agent`/`CLAWVIBE_AGENT_ID` does not register (avoids a bogus `default` agent in the picker).
 
 ## Development
 
