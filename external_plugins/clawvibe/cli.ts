@@ -81,20 +81,19 @@ function writeAgentDef(id: string, name: string | undefined, emoji: string | und
   const path = agentDefPath(id)
   if (existsSync(path)) return false
   mkdirSync(AGENTS_DIR, { recursive: true })
-  // `name` must equal the id (routing/--agent); `displayName` is the friendly
-  // label shown in the app (read by shared/identity.ts).
-  const fm = ['---', `name: ${id}`]
-  if (name) fm.push(`displayName: ${name}`)
-  fm.push(`description: ${name || id} — ClawVibe channel agent.`)
-  if (emoji) fm.push(`emoji: ${emoji}`)
-  fm.push('---', '')
-  const who = name || id
-  const body = prompt ??
-    `You are ${who}, reachable over the ClawVibe mobile app.\n\n` +
-    'When a device message arrives (a `<channel source="clawvibe" conversation_id="...">` tag), ' +
-    'reply to it using the `reply` tool, passing the `conversation_id` from the inbound tag so it ' +
-    'lands in the same thread. Keep replies brief. Do not take other actions unless asked.\n'
-  writeFileSync(path, fm.join('\n') + body)
+  const display = name || id
+  const em = emoji || '🤖'
+  // Frontmatter `name` must equal the id (routing/--agent). The gateway never
+  // reads this file — identity reaches the app via the agent's replies — so the
+  // display name + emoji are baked into the BODY (the system prompt) instead, so
+  // the agent reports them on every reply.
+  const fm = ['---', `name: ${id}`, `description: ${display} — ClawVibe channel agent.`, '---', '']
+  const persona = prompt ?? `You are ${display}, reachable over the ClawVibe mobile app. Keep replies brief and in character.`
+  const channel =
+    `\n\n## ClawVibe channel\n` +
+    `Your display name is "${display}" and your emoji is ${em}. On EVERY \`reply\`, set the \`name\` ("${display}") and \`emoji\` (${em}) parameters.\n` +
+    `When a device message arrives (a \`<channel source="clawvibe" conversation_id="...">\` tag), reply to it with the \`reply\` tool using that conversation_id. Take no other action unless asked.\n`
+  writeFileSync(path, fm.join('\n') + persona + channel)
   return true
 }
 

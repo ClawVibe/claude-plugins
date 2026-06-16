@@ -79,7 +79,10 @@ process.on('unhandledRejection', err => {
 // ── Agent registry (IPC) ──────────────────────────────────────────────────────
 
 type SockState = { decode: (chunk: Uint8Array) => void; agentId?: string }
-type AgentConn = { agentId: string; identity: AgentIdentity; sock: Socket<SockState>; registeredAt: number }
+// identity + confirmed are learned from the agent's replies, not from registration:
+// an agent is listed to the app only once it has answered a probe (confirmed), and
+// its name/emoji are refreshed from every reply (so mid-flight changes propagate).
+type AgentConn = { agentId: string; identity?: AgentIdentity; sock: Socket<SockState>; registeredAt: number; confirmed: boolean; lastProbeAt: number }
 
 const agentClients = new Map<string, AgentConn>() // keyed by agentId, insertion-ordered
 
@@ -91,15 +94,29 @@ function writeIpc(sock: Socket<SockState>, frame: IpcFrame): void {
 
 /** Choose an agent when the sessionKey carries none (legacy / device:<id>). */
 function pickFallbackAgentId(): string | null {
-  if (agentClients.size === 0) return null
-  const ids = [...agentClients.keys()]
-  return ids[0] // first-registered = defaultId
+  for (const c of agentClients.values()) if (c.confirmed) return c.agentId // first confirmed
+  return null
+}
+
+/** Send a liveness/identity probe over the channel path. Only a real --channels
+ *  agent turns it into a turn and replies; the reply confirms + carries identity. */
+function probeAgent(conn: AgentConn): void {
+  const nonce = randomBytes(6).toString('hex')
+  const sessionKey = `clawvibe:probe:${nonce}`
+  const runId = nextMsgId()
+  conn.lastProbeAt = Date.now()
+  writeIpc(conn.sock, {
+    v: 1, t: 'inbound', sessionKey, runId,
+    text: `[CLAWVIBE_PING ${nonce}] automated liveness check — reply "pong" to this conversation with your name and emoji.`,
+    meta: { device_id: '', device_name: 'clawvibe', conversation_id: sessionKey, message_id: runId, ts: new Date().toISOString() },
+  })
+  process.stderr.write(`clawvibe-daemon: probing agent=${conn.agentId}\n`)
 }
 
 function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
   switch (frame.t) {
     case 'register': {
-      const { agentId, identity } = frame
+      const { agentId } = frame
       const prev = agentClients.get(agentId)
       if (prev && prev.sock !== sock) {
         // Last-writer-wins: a fresh client for the same agent replaces the stale one.
@@ -107,12 +124,32 @@ function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
         try { prev.sock.end() } catch {}
       }
       sock.data.agentId = agentId
-      agentClients.set(agentId, { agentId, identity, sock, registeredAt: Date.now() })
+      const conn: AgentConn = { agentId, sock, registeredAt: Date.now(), confirmed: false, lastProbeAt: 0 }
+      agentClients.set(agentId, conn)
       writeIpc(sock, { v: 1, t: 'register.ok', agentId })
-      process.stderr.write(`clawvibe-daemon: agent registered id=${agentId} name="${identity.name}"\n`)
+      process.stderr.write(`clawvibe-daemon: agent registered id=${agentId} (probing for confirmation)\n`)
+      probeAgent(conn)
       return
     }
     case 'reply': {
+      // Refresh identity + confirm liveness from ANY reply (incl. mid-flight changes).
+      const agentId = sock.data?.agentId
+      const conn = agentId ? agentClients.get(agentId) : undefined
+      if (conn) {
+        if (frame.name !== undefined || frame.emoji !== undefined) {
+          conn.identity = {
+            name: frame.name ?? conn.identity?.name ?? conn.agentId,
+            emoji: frame.emoji ?? conn.identity?.emoji ?? null,
+          }
+        }
+        if (!conn.confirmed) {
+          conn.confirmed = true
+          process.stderr.write(`clawvibe-daemon: agent confirmed id=${conn.agentId} name="${conn.identity?.name ?? conn.agentId}"\n`)
+        }
+      }
+      // A probe reply confirms liveness/identity (handled above) but is not device-facing.
+      if (frame.sessionKey.startsWith('clawvibe:probe')) return
+
       const run = activeRuns.get(frame.sessionKey)
       if (!run) {
         process.stderr.write(`clawvibe-daemon: reply for unknown session ${frame.sessionKey}\n`)
@@ -446,8 +483,18 @@ function handleHealth(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   sendFrame(ws, { type: 'res', id: req.id, ok: true, payload: { ok: true } })
 }
 
+// Throttled lazy re-probe of connected-but-unconfirmed agents (decision: probe on
+// register + reconfirm lazily when the app asks for the list).
+function reprobeUnconfirmed(): void {
+  const now = Date.now()
+  for (const c of agentClients.values()) {
+    if (!c.confirmed && now - c.lastProbeAt > 5000) probeAgent(c)
+  }
+}
+
 function handleAgentsList(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
-  const agents = [...agentClients.values()]
+  reprobeUnconfirmed()
+  const agents = [...agentClients.values()].filter(c => c.confirmed)
   const defaultId = agents.length > 0 ? agents[0].agentId : 'default'
   sendFrame(ws, {
     type: 'res', id: req.id, ok: true,
@@ -457,8 +504,8 @@ function handleAgentsList(ws: ServerWebSocket<WSData>, req: RequestFrame): void 
       scope: 'all',
       agents: agents.map(c => ({
         id: c.agentId,
-        name: c.identity.name,
-        identity: { name: c.identity.name, emoji: c.identity.emoji },
+        name: c.identity?.name ?? c.agentId,
+        identity: { name: c.identity?.name ?? c.agentId, emoji: c.identity?.emoji ?? null },
         workspace: null,
         model: null,
       })),
@@ -470,13 +517,13 @@ function handleAgentIdentityGet(ws: ServerWebSocket<WSData>, req: RequestFrame):
   const params = req.params ?? {}
   const agentId = (params.agentId as string) ?? 'default'
   const c = agentClients.get(agentId)
-  if (!c) {
+  if (!c || !c.confirmed) {
     sendFrame(ws, { type: 'res', id: req.id, ok: false, error: { message: `agent not found: ${agentId}` } })
     return
   }
   sendFrame(ws, {
     type: 'res', id: req.id, ok: true,
-    payload: { agentId: c.agentId, name: c.identity.name, avatar: null, emoji: c.identity.emoji },
+    payload: { agentId: c.agentId, name: c.identity?.name ?? c.agentId, avatar: null, emoji: c.identity?.emoji ?? null },
   })
 }
 
@@ -553,10 +600,11 @@ function startHttpServer() {
         return Response.json({ ok: true, server: 'clawvibe', version: '0.0.1' })
       }
 
-      // Agent discovery (HTTP) — served from the live registry.
+      // Agent discovery (HTTP) — confirmed (probe-answered) agents only.
       if (url.pathname === '/agents' && req.method === 'GET') {
-        const agents = [...agentClients.values()].map(c => ({
-          id: c.agentId, name: c.identity.name, emoji: c.identity.emoji,
+        reprobeUnconfirmed()
+        const agents = [...agentClients.values()].filter(c => c.confirmed).map(c => ({
+          id: c.agentId, name: c.identity?.name ?? c.agentId, emoji: c.identity?.emoji ?? null,
         }))
         return Response.json(agents)
       }

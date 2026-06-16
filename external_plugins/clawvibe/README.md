@@ -7,7 +7,7 @@ Works on any Claude Code instance — ClawCode users and generic users alike —
 ## Architecture
 
 - **Gateway daemon** (`gateway-daemon.ts`): one long-lived, detached singleton per machine. Owns the HTTP/WS port (`:8791`), device pairing/`access.json`, and a dynamic registry of connected agents. Auto-spawned by the first agent's channel client (via `setsid`) and lingers so pairing keeps working.
-- **Channel client** (`channel-client.ts`): the per-session MCP server loaded via `--channels`. Connects to the daemon over a Unix socket, registers its agent (id from `CLAUDE_CODE_AGENT`, identity from `~/.claude/agents/<id>.md`), relays inbound messages, and sends replies.
+- **Channel client** (`channel-client.ts`): the per-session MCP server loaded via `--channels`. Connects to the daemon over a Unix socket, registers its agent id (`CLAUDE_CODE_AGENT`), relays inbound messages, and sends replies. The daemon **probes** it to confirm it's a live `--channels` agent and learns its display name/emoji from the reply (every reply carries them) — so only confirmed agents are listed, and identity stays current without reading any file.
 
 The iOS app picks an agent and encodes it in the routing key `sessionKey = "agent:<agentId>:clawvibe:app:<deviceId>"`; the daemon routes to that agent and returns its reply to only the originating device.
 
@@ -28,7 +28,7 @@ Requires [Bun](https://bun.sh) as the runtime. **Dependencies are bundled** — 
 
 Agents are declarative: `clawvibe agent add <id>` writes `~/.claude/agents/<id>.md` (its name/emoji/persona) and records the id in `$CLAWVIBE_STATE_DIR/managed-agents.json`. `clawvibe agents up` starts a background channel session per configured agent (idempotent — skips ones already running); each registers with the shared daemon and appears in the app's picker.
 
-The `<id>` is the routing slug (it becomes `name:` in the def and the `--agent` value). Use `--name` for the friendly label shown in the app — written as `displayName:` so the slug stays intact:
+The `<id>` is the routing slug (it becomes `name:` in the def and the `--agent` value). `--name`/`--emoji` are baked into the agent's prompt so it reports them on every reply (the gateway learns identity from replies, never from the file):
 
 ```
 clawvibe agent add patrick --name "Patrick" --emoji ⭐ [--model <m>] [--prompt "<persona>"]

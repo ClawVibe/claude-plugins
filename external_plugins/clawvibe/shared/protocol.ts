@@ -64,19 +64,24 @@ export type AgentIdentity = { name: string; emoji: string | null }
 
 export const IPC_VERSION = 1
 
-/** client → daemon: announce this agent client and its identity. */
+/** client → daemon: announce this agent client. Identity is NOT sent here — the
+ *  daemon learns the agent's display name/emoji from its replies (probe + every
+ *  reply carries them), and only lists agents that have answered (confirmed). */
 export type IpcRegister = {
   v: 1
   t: 'register'
   agentId: string
-  identity: AgentIdentity
   pid: number
 }
 
 /** daemon → client: registration accepted. */
 export type IpcRegisterOk = { v: 1; t: 'register.ok'; agentId: string }
 
-/** client → daemon: send an assistant message back to the originating device. */
+/** client → daemon: send an assistant message back to the originating device.
+ *  Every reply also carries the agent's current display name/emoji so the daemon
+ *  can confirm liveness and keep the registry identity fresh (incl. mid-flight
+ *  changes). A reply to a `clawvibe:probe:*` sessionKey is a liveness/identity
+ *  confirmation and is NOT broadcast to any device. */
 export type IpcReply = {
   v: 1
   t: 'reply'
@@ -85,6 +90,8 @@ export type IpcReply = {
   state: ChatState
   text?: string
   errorMessage?: string
+  name?: string
+  emoji?: string | null
 }
 
 /** client → daemon: edit a previously sent message. */
