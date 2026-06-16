@@ -14067,7 +14067,7 @@ class StdioServerTransport {
 
 // channel-client.ts
 import { existsSync } from "fs";
-import { join as join3 } from "path";
+import { join as join2 } from "path";
 
 // shared/access.ts
 import { randomBytes } from "crypto";
@@ -14185,49 +14185,6 @@ function drainApprovalSentinels() {
     writeAccess(a);
 }
 
-// shared/identity.ts
-import { readFileSync as readFileSync2 } from "fs";
-import { homedir as homedir2 } from "os";
-import { join as join2 } from "path";
-function parseFrontmatter(md) {
-  const out = {};
-  const m = /^---\s*\n([\s\S]*?)\n---/.exec(md);
-  if (!m)
-    return out;
-  for (const line of m[1].split(`
-`)) {
-    const kv = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line.trim());
-    if (!kv)
-      continue;
-    let val = kv[2].trim();
-    if (val.startsWith('"') && val.endsWith('"') || val.startsWith("'") && val.endsWith("'")) {
-      val = val.slice(1, -1);
-    }
-    out[kv[1].toLowerCase()] = val;
-  }
-  return out;
-}
-function readAgentFrontmatter(agentId) {
-  const candidates = [
-    join2(homedir2(), ".claude", "agents", `${agentId}.md`),
-    join2(process.cwd(), ".claude", "agents", `${agentId}.md`)
-  ];
-  for (const path of candidates) {
-    try {
-      return parseFrontmatter(readFileSync2(path, "utf8"));
-    } catch {}
-  }
-  return null;
-}
-function loadAgentIdentity(agentId) {
-  const fm = readAgentFrontmatter(agentId) ?? {};
-  const envName = process.env.CLAWVIBE_AGENT_NAME;
-  const envEmoji = process.env.CLAWVIBE_AGENT_EMOJI;
-  const name = fm.displayname || fm.name || envName || agentId;
-  const emoji2 = fm.emoji || envEmoji || null;
-  return { name, emoji: emoji2 };
-}
-
 // shared/protocol.ts
 function agentIdFromSessionKey(sessionKey) {
   if (!sessionKey)
@@ -14261,8 +14218,7 @@ function makeLineDecoder(onFrame) {
 // channel-client.ts
 var EXPLICIT_AGENT = process.env.CLAUDE_CODE_AGENT || process.env.CLAWVIBE_AGENT_ID || "";
 var AGENT_ID = EXPLICIT_AGENT || "default";
-var IDENTITY = loadAgentIdentity(AGENT_ID);
-var DAEMON_PATH = ["gateway-daemon.js", "gateway-daemon.ts"].map((f) => join3(import.meta.dir, f)).find(existsSync) ?? join3(import.meta.dir, "gateway-daemon.ts");
+var DAEMON_PATH = ["gateway-daemon.js", "gateway-daemon.ts"].map((f) => join2(import.meta.dir, f)).find(existsSync) ?? join2(import.meta.dir, "gateway-daemon.ts");
 ensureStateDirs();
 var mcp = new Server({ name: "clawvibe", version: "0.0.1" }, {
   capabilities: {
@@ -14279,7 +14235,11 @@ var mcp = new Server({ name: "clawvibe", version: "0.0.1" }, {
 ` + `  [TEXT]  <text>      \u2014 text-only, no TTS
 ` + `  ---                 \u2014 segment separator (new chat bubble)
 ` + `
-` + `Reply with the \`reply\` tool, passing conversation_id from the inbound channel tag to reply in the same thread.`
+` + `Reply with the \`reply\` tool, passing conversation_id from the inbound channel tag to reply in the same thread.
+` + `
+` + `IDENTITY \u2014 on EVERY \`reply\`, set the \`name\` and \`emoji\` parameters to your display name and emoji. The channel uses them to keep your listing current (it never reads any file), so include them every time even if unchanged.
+` + `
+` + `LIVENESS \u2014 if you receive a message whose conversation_id starts with \`clawvibe:probe\`, it is an automated check, not a user. Immediately \`reply\` to that SAME conversation_id with text \`pong\` and your \`name\`/\`emoji\`. Do not narrate it or tell the user about it.`
 });
 var convToRun = new Map;
 var lastSessionKey;
@@ -14291,12 +14251,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "reply",
-      description: "Send an assistant message to the paired ClawVibe device(s). Use conversation_id from the inbound channel tag to reply in the same thread. Text may include [SPEAK]/[TEXT]/--- directives.",
+      description: "Send an assistant message to the paired ClawVibe device(s). Use conversation_id from the inbound channel tag to reply in the same thread. Text may include [SPEAK]/[TEXT]/--- directives. ALWAYS pass your display name and emoji (name, emoji) \u2014 the channel uses them to keep your identity current.",
       inputSchema: {
         type: "object",
         properties: {
           conversation_id: { type: "string" },
           text: { type: "string" },
+          name: { type: "string", description: "Your display name (include on every reply)" },
+          emoji: { type: "string", description: "Your emoji (include on every reply)" },
           reply_to: { type: "string" }
         },
         required: ["text"]
@@ -14324,9 +14286,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "reply": {
         const conversationId = args.conversation_id ?? lastSessionKey ?? "default";
         const text = args.text;
+        const name = args.name;
+        const emoji2 = args.emoji;
         const id = nextMsgId();
         const runId = convToRun.get(conversationId) ?? id;
-        sendIpc({ v: 1, t: "reply", sessionKey: conversationId, runId, state: "final", text });
+        sendIpc({ v: 1, t: "reply", sessionKey: conversationId, runId, state: "final", text, name, emoji: emoji2 });
         return { content: [{ type: "text", text: `sent (${id})` }] };
       }
       case "edit_message": {
@@ -14434,8 +14398,8 @@ async function connectDaemon() {
           }
         }
       });
-      sendIpc({ v: 1, t: "register", agentId: AGENT_ID, identity: IDENTITY, pid: process.pid });
-      process.stderr.write(`clawvibe-client: connected + registered agent=${AGENT_ID} name="${IDENTITY.name}"
+      sendIpc({ v: 1, t: "register", agentId: AGENT_ID, pid: process.pid });
+      process.stderr.write(`clawvibe-client: connected + registered agent=${AGENT_ID} (awaiting probe confirmation)
 `);
       return;
     } catch {

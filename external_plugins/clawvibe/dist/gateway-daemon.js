@@ -249,15 +249,31 @@ function writeIpc(sock, frame) {
   }
 }
 function pickFallbackAgentId() {
-  if (agentClients.size === 0)
-    return null;
-  const ids = [...agentClients.keys()];
-  return ids[0];
+  for (const c of agentClients.values())
+    if (c.confirmed)
+      return c.agentId;
+  return null;
+}
+function probeAgent(conn) {
+  const nonce = randomBytes2(6).toString("hex");
+  const sessionKey = `clawvibe:probe:${nonce}`;
+  const runId = nextMsgId();
+  conn.lastProbeAt = Date.now();
+  writeIpc(conn.sock, {
+    v: 1,
+    t: "inbound",
+    sessionKey,
+    runId,
+    text: `[CLAWVIBE_PING ${nonce}] automated liveness check \u2014 reply "pong" to this conversation with your name and emoji.`,
+    meta: { device_id: "", device_name: "clawvibe", conversation_id: sessionKey, message_id: runId, ts: new Date().toISOString() }
+  });
+  process.stderr.write(`clawvibe-daemon: probing agent=${conn.agentId}
+`);
 }
 function handleIpcFrame(sock, frame) {
   switch (frame.t) {
     case "register": {
-      const { agentId, identity } = frame;
+      const { agentId } = frame;
       const prev = agentClients.get(agentId);
       if (prev && prev.sock !== sock) {
         process.stderr.write(`clawvibe-daemon: replacing stale client for agent=${agentId}
@@ -267,13 +283,32 @@ function handleIpcFrame(sock, frame) {
         } catch {}
       }
       sock.data.agentId = agentId;
-      agentClients.set(agentId, { agentId, identity, sock, registeredAt: Date.now() });
+      const conn = { agentId, sock, registeredAt: Date.now(), confirmed: false, lastProbeAt: 0 };
+      agentClients.set(agentId, conn);
       writeIpc(sock, { v: 1, t: "register.ok", agentId });
-      process.stderr.write(`clawvibe-daemon: agent registered id=${agentId} name="${identity.name}"
+      process.stderr.write(`clawvibe-daemon: agent registered id=${agentId} (probing for confirmation)
 `);
+      probeAgent(conn);
       return;
     }
     case "reply": {
+      const agentId = sock.data?.agentId;
+      const conn = agentId ? agentClients.get(agentId) : undefined;
+      if (conn) {
+        if (frame.name !== undefined || frame.emoji !== undefined) {
+          conn.identity = {
+            name: frame.name ?? conn.identity?.name ?? conn.agentId,
+            emoji: frame.emoji ?? conn.identity?.emoji ?? null
+          };
+        }
+        if (!conn.confirmed) {
+          conn.confirmed = true;
+          process.stderr.write(`clawvibe-daemon: agent confirmed id=${conn.agentId} name="${conn.identity?.name ?? conn.agentId}"
+`);
+        }
+      }
+      if (frame.sessionKey.startsWith("clawvibe:probe"))
+        return;
       const run = activeRuns.get(frame.sessionKey);
       if (!run) {
         process.stderr.write(`clawvibe-daemon: reply for unknown session ${frame.sessionKey}
@@ -636,8 +671,16 @@ function handleChatSend(ws, req) {
 function handleHealth(ws, req) {
   sendFrame(ws, { type: "res", id: req.id, ok: true, payload: { ok: true } });
 }
+function reprobeUnconfirmed() {
+  const now = Date.now();
+  for (const c of agentClients.values()) {
+    if (!c.confirmed && now - c.lastProbeAt > 5000)
+      probeAgent(c);
+  }
+}
 function handleAgentsList(ws, req) {
-  const agents = [...agentClients.values()];
+  reprobeUnconfirmed();
+  const agents = [...agentClients.values()].filter((c) => c.confirmed);
   const defaultId = agents.length > 0 ? agents[0].agentId : "default";
   sendFrame(ws, {
     type: "res",
@@ -649,8 +692,8 @@ function handleAgentsList(ws, req) {
       scope: "all",
       agents: agents.map((c) => ({
         id: c.agentId,
-        name: c.identity.name,
-        identity: { name: c.identity.name, emoji: c.identity.emoji },
+        name: c.identity?.name ?? c.agentId,
+        identity: { name: c.identity?.name ?? c.agentId, emoji: c.identity?.emoji ?? null },
         workspace: null,
         model: null
       }))
@@ -661,7 +704,7 @@ function handleAgentIdentityGet(ws, req) {
   const params = req.params ?? {};
   const agentId = params.agentId ?? "default";
   const c = agentClients.get(agentId);
-  if (!c) {
+  if (!c || !c.confirmed) {
     sendFrame(ws, { type: "res", id: req.id, ok: false, error: { message: `agent not found: ${agentId}` } });
     return;
   }
@@ -669,7 +712,7 @@ function handleAgentIdentityGet(ws, req) {
     type: "res",
     id: req.id,
     ok: true,
-    payload: { agentId: c.agentId, name: c.identity.name, avatar: null, emoji: c.identity.emoji }
+    payload: { agentId: c.agentId, name: c.identity?.name ?? c.agentId, avatar: null, emoji: c.identity?.emoji ?? null }
   });
 }
 function handleRPC(ws, req) {
@@ -741,10 +784,11 @@ function startHttpServer() {
         return Response.json({ ok: true, server: "clawvibe", version: "0.0.1" });
       }
       if (url.pathname === "/agents" && req.method === "GET") {
-        const agents = [...agentClients.values()].map((c) => ({
+        reprobeUnconfirmed();
+        const agents = [...agentClients.values()].filter((c) => c.confirmed).map((c) => ({
           id: c.agentId,
-          name: c.identity.name,
-          emoji: c.identity.emoji
+          name: c.identity?.name ?? c.agentId,
+          emoji: c.identity?.emoji ?? null
         }));
         return Response.json(agents);
       }

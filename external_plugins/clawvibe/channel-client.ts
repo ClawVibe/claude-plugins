@@ -18,10 +18,9 @@ import { join } from 'path'
 import type { Socket } from 'bun'
 
 import { STATE_DIR, SOCK_FILE, ensureStateDirs } from './shared/access.ts'
-import { loadAgentIdentity } from './shared/identity.ts'
 import {
   makeLineDecoder, encodeFrame,
-  type IpcFrame, type IpcInbound, type InboundMeta, type AgentIdentity,
+  type IpcFrame, type IpcInbound, type InboundMeta,
 } from './shared/protocol.ts'
 
 // A session only acts as a channel agent when it was launched for a specific
@@ -31,7 +30,6 @@ import {
 // pollute the picker and fight other such sessions for the "default" id.
 const EXPLICIT_AGENT = process.env.CLAUDE_CODE_AGENT || process.env.CLAWVIBE_AGENT_ID || ''
 const AGENT_ID = EXPLICIT_AGENT || 'default'
-const IDENTITY: AgentIdentity = loadAgentIdentity(AGENT_ID)
 // Resolve the daemon next to the running file — `.js` when bundled into dist/,
 // `.ts` when running from source.
 const DAEMON_PATH =
@@ -61,7 +59,11 @@ const mcp = new Server(
       `  [TEXT]  <text>      — text-only, no TTS\n` +
       `  ---                 — segment separator (new chat bubble)\n` +
       `\n` +
-      `Reply with the \`reply\` tool, passing conversation_id from the inbound channel tag to reply in the same thread.`,
+      `Reply with the \`reply\` tool, passing conversation_id from the inbound channel tag to reply in the same thread.\n` +
+      `\n` +
+      `IDENTITY — on EVERY \`reply\`, set the \`name\` and \`emoji\` parameters to your display name and emoji. The channel uses them to keep your listing current (it never reads any file), so include them every time even if unchanged.\n` +
+      `\n` +
+      `LIVENESS — if you receive a message whose conversation_id starts with \`clawvibe:probe\`, it is an automated check, not a user. Immediately \`reply\` to that SAME conversation_id with text \`pong\` and your \`name\`/\`emoji\`. Do not narrate it or tell the user about it.`,
   },
 )
 
@@ -76,12 +78,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Send an assistant message to the paired ClawVibe device(s). Use conversation_id from the inbound channel tag to reply in the same thread. Text may include [SPEAK]/[TEXT]/--- directives.',
+        'Send an assistant message to the paired ClawVibe device(s). Use conversation_id from the inbound channel tag to reply in the same thread. Text may include [SPEAK]/[TEXT]/--- directives. ALWAYS pass your display name and emoji (name, emoji) — the channel uses them to keep your identity current.',
       inputSchema: {
         type: 'object',
         properties: {
           conversation_id: { type: 'string' },
           text: { type: 'string' },
+          name: { type: 'string', description: 'Your display name (include on every reply)' },
+          emoji: { type: 'string', description: 'Your emoji (include on every reply)' },
           reply_to: { type: 'string' },
         },
         required: ['text'],
@@ -110,9 +114,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'reply': {
         const conversationId = (args.conversation_id as string | undefined) ?? lastSessionKey ?? 'default'
         const text = args.text as string
+        const name = args.name as string | undefined
+        const emoji = args.emoji as string | undefined
         const id = nextMsgId()
         const runId = convToRun.get(conversationId) ?? id
-        sendIpc({ v: 1, t: 'reply', sessionKey: conversationId, runId, state: 'final', text })
+        sendIpc({ v: 1, t: 'reply', sessionKey: conversationId, runId, state: 'final', text, name, emoji })
         return { content: [{ type: 'text', text: `sent (${id})` }] }
       }
       case 'edit_message': {
@@ -215,8 +221,8 @@ async function connectDaemon(): Promise<void> {
         },
       })
       // Register this agent with the daemon.
-      sendIpc({ v: 1, t: 'register', agentId: AGENT_ID, identity: IDENTITY, pid: process.pid })
-      process.stderr.write(`clawvibe-client: connected + registered agent=${AGENT_ID} name="${IDENTITY.name}"\n`)
+      sendIpc({ v: 1, t: 'register', agentId: AGENT_ID, pid: process.pid })
+      process.stderr.write(`clawvibe-client: connected + registered agent=${AGENT_ID} (awaiting probe confirmation)\n`)
       return
     } catch {
       if (attempt === 0) spawnDaemon() // first failure: daemon likely absent
