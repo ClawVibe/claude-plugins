@@ -14220,7 +14220,7 @@ var EXPLICIT_AGENT = process.env.CLAUDE_CODE_AGENT || process.env.CLAWVIBE_AGENT
 var AGENT_ID = EXPLICIT_AGENT || "default";
 var DAEMON_PATH = ["gateway-daemon.js", "gateway-daemon.ts"].map((f) => join2(import.meta.dir, f)).find(existsSync) ?? join2(import.meta.dir, "gateway-daemon.ts");
 ensureStateDirs();
-var mcp = new Server({ name: "clawvibe", version: "0.0.1" }, {
+var mcp = new Server({ name: "clawvibe", version: "0.1.0" }, {
   capabilities: {
     tools: {},
     experimental: { "claude/channel": {}, "claude/channel/permission": {} }

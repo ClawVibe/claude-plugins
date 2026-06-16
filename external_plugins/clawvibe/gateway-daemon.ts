@@ -422,7 +422,7 @@ function handleConnect(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
     payload: {
       type: 'hello_ok',
       protocol: 3,
-      server: { name: 'clawvibe', version: '0.0.1' },
+      server: { name: 'clawvibe', version: '0.1.0' },
       features: {},
       snapshot: {
         presence: [], health: { ok: true }, stateVersion: { presence: 0, health: 0 },
@@ -597,7 +597,7 @@ function startHttpServer() {
       const url = new URL(req.url)
 
       if ((url.pathname === '/' || url.pathname === '/health') && !req.headers.get('upgrade')) {
-        return Response.json({ ok: true, server: 'clawvibe', version: '0.0.1' })
+        return Response.json({ ok: true, server: 'clawvibe', version: '0.1.0' })
       }
 
       // Agent discovery (HTTP) — confirmed (probe-answered) agents only.

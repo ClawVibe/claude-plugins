@@ -599,7 +599,7 @@ function handleConnect(ws, req) {
     payload: {
       type: "hello_ok",
       protocol: 3,
-      server: { name: "clawvibe", version: "0.0.1" },
+      server: { name: "clawvibe", version: "0.1.0" },
       features: {},
       snapshot: {
         presence: [],
@@ -781,7 +781,7 @@ function startHttpServer() {
     fetch(req, server) {
       const url = new URL(req.url);
       if ((url.pathname === "/" || url.pathname === "/health") && !req.headers.get("upgrade")) {
-        return Response.json({ ok: true, server: "clawvibe", version: "0.0.1" });
+        return Response.json({ ok: true, server: "clawvibe", version: "0.1.0" });
       }
       if (url.pathname === "/agents" && req.method === "GET") {
         reprobeUnconfirmed();
