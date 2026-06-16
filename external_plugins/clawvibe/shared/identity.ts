@@ -44,14 +44,17 @@ function readAgentFrontmatter(agentId: string): Record<string, string> | null {
 
 /**
  * Resolve {name, emoji} for an agent id.
- * Precedence: agents/<id>.md frontmatter → env (CLAWVIBE_AGENT_NAME/EMOJI) → {name: id, emoji: null}.
+ * Display name precedence: frontmatter `displayName` (a friendly name, since the
+ * frontmatter `name` must equal the agent id/slug for routing) → `name` →
+ * env CLAWVIBE_AGENT_NAME → the id. Emoji: frontmatter → env → null.
+ * (parseFrontmatter lowercases keys, so `displayName` is read as `displayname`.)
  */
 export function loadAgentIdentity(agentId: string): AgentIdentity {
   const fm = readAgentFrontmatter(agentId) ?? {}
   const envName = process.env.CLAWVIBE_AGENT_NAME
   const envEmoji = process.env.CLAWVIBE_AGENT_EMOJI
 
-  const name = fm.name || envName || agentId
+  const name = fm.displayname || fm.name || envName || agentId
   const emoji = fm.emoji || envEmoji || null
   return { name, emoji }
 }

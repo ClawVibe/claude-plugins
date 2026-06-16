@@ -14223,7 +14223,7 @@ function loadAgentIdentity(agentId) {
   const fm = readAgentFrontmatter(agentId) ?? {};
   const envName = process.env.CLAWVIBE_AGENT_NAME;
   const envEmoji = process.env.CLAWVIBE_AGENT_EMOJI;
-  const name = fm.name || envName || agentId;
+  const name = fm.displayname || fm.name || envName || agentId;
   const emoji2 = fm.emoji || envEmoji || null;
   return { name, emoji: emoji2 };
 }

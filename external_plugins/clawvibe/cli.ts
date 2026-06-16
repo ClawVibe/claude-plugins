@@ -77,15 +77,20 @@ function parseFlags(args: string[]): { positional: string[]; flags: Record<strin
 
 function agentDefPath(id: string): string { return join(AGENTS_DIR, `${id}.md`) }
 
-function writeAgentDef(id: string, emoji: string | undefined, prompt: string | undefined): boolean {
+function writeAgentDef(id: string, name: string | undefined, emoji: string | undefined, prompt: string | undefined): boolean {
   const path = agentDefPath(id)
   if (existsSync(path)) return false
   mkdirSync(AGENTS_DIR, { recursive: true })
-  const fm = ['---', `name: ${id}`, `description: ${id} — ClawVibe channel agent.`]
+  // `name` must equal the id (routing/--agent); `displayName` is the friendly
+  // label shown in the app (read by shared/identity.ts).
+  const fm = ['---', `name: ${id}`]
+  if (name) fm.push(`displayName: ${name}`)
+  fm.push(`description: ${name || id} — ClawVibe channel agent.`)
   if (emoji) fm.push(`emoji: ${emoji}`)
   fm.push('---', '')
+  const who = name || id
   const body = prompt ??
-    `You are ${id}, reachable over the ClawVibe mobile app.\n\n` +
+    `You are ${who}, reachable over the ClawVibe mobile app.\n\n` +
     'When a device message arrives (a `<channel source="clawvibe" conversation_id="...">` tag), ' +
     'reply to it using the `reply` tool, passing the `conversation_id` from the inbound tag so it ' +
     'lands in the same thread. Keep replies brief. Do not take other actions unless asked.\n'
@@ -96,8 +101,8 @@ function writeAgentDef(id: string, emoji: string | undefined, prompt: string | u
 function cmdAgentAdd(args: string[]): number {
   const { positional, flags } = parseFlags(args)
   const id = positional[0]
-  if (!id) { console.error('usage: clawvibe agent add <id> [--emoji E] [--model M] [--prompt P]'); return 1 }
-  const created = writeAgentDef(id, flags.emoji as string | undefined, flags.prompt as string | undefined)
+  if (!id) { console.error('usage: clawvibe agent add <id> [--name "Friendly Name"] [--emoji E] [--model M] [--prompt P]'); return 1 }
+  const created = writeAgentDef(id, flags.name as string | undefined, flags.emoji as string | undefined, flags.prompt as string | undefined)
   const cfg = readConfig()
   if (!cfg.find(a => a.id === id)) {
     cfg.push({ id, ...(flags.model ? { model: flags.model as string } : {}) })
@@ -259,6 +264,7 @@ async function main(): Promise<number> {
   const [verb, sub, ...rest] = process.argv.slice(2)
   switch (verb) {
     case 'setup': return cmdSetup([sub, ...rest].filter(Boolean))
+    case 'tailscale-check': { console.log('ClawVibe ingress check:'); await checkTailscale(false); return 0 }
     case 'install-service': return cmdInstallService()
     case 'agents':
       if (sub === 'up') return cmdAgentsUp()

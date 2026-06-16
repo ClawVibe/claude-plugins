@@ -132,11 +132,13 @@ clawcode restart spongebob
 
 ```bash
 clawvibe setup [--apply-tailscale]   # bundle check, link ~/.local/bin/clawvibe, Tailscale check, agents up
-clawvibe agent add <id> --emoji 🤖   # writes ~/.claude/agents/<id>.md + managed-agents.json
+clawvibe agent add <id> --name "Friendly" --emoji 🤖   # writes ~/.claude/agents/<id>.md (+ managed-agents.json)
 clawvibe agents up | down            # start (idempotent) / stop all clawvibe-* sessions
 clawvibe agent list                  # configured + running/registered status
 clawvibe install-service             # systemd --user unit running `agents up` at login/boot
 ```
 
-- Managed-agent config: `$CLAWVIBE_STATE_DIR/managed-agents.json` (`[{id, model?}]`). Identity/persona come from `~/.claude/agents/<id>.md`.
+- Managed-agent config: `$CLAWVIBE_STATE_DIR/managed-agents.json` (`[{id, model?}]`). Identity/persona come from `~/.claude/agents/<id>.md`: `name:` MUST equal the id/slug (routing/`--agent`); `--name` writes a separate `displayName:` that `shared/identity.ts` prefers for the app label.
+- `clawvibe qr` runs the Tailscale ingress check first (warns on a non-TLS-TCP forward before you try to pair).
+- The app's agent list = the **live daemon registry** (connected channel clients), not the agents folder or managed-agents.json. `install-service`/`agents up` start only the agents in managed-agents.json — not every file in `~/.claude/agents/`.
 - `agents up` launches each as `claude --bg --channels … --agent <id> --permission-mode acceptEdits --allowed-tools <reply tools> --name clawvibe-<id>`, **from `$HOME`** (a trusted dir — otherwise the bg session blocks on a directory-trust prompt). The first launch auto-spawns the daemon (detached via `setsid`, so it survives agent restarts).
