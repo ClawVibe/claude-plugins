@@ -28,8 +28,10 @@ Requires [Bun](https://bun.sh) as the runtime. **Dependencies are bundled** — 
 
 Agents are declarative: `clawvibe agent add <id>` writes `~/.claude/agents/<id>.md` (its name/emoji/persona) and records the id in `$CLAWVIBE_STATE_DIR/managed-agents.json`. `clawvibe agents up` starts a background channel session per configured agent (idempotent — skips ones already running); each registers with the shared daemon and appears in the app's picker.
 
+The `<id>` is the routing slug (it becomes `name:` in the def and the `--agent` value). Use `--name` for the friendly label shown in the app — written as `displayName:` so the slug stays intact:
+
 ```
-clawvibe agent add patrick --emoji ⭐ [--model <m>] [--prompt "<persona>"]
+clawvibe agent add patrick --name "Patrick" --emoji ⭐ [--model <m>] [--prompt "<persona>"]
 clawvibe agent list                  # configured agents + running/registered status
 clawvibe agents up | down            # start all / stop all
 clawvibe agent rm <id> [--purge]     # unconfigure (--purge also deletes the def)
@@ -68,7 +70,7 @@ sudo tailscale serve --bg --tls-terminated-tcp=8791 tcp://localhost:8791
 
 **QR / bootstrap (primary)** — use the `connect` skill, or run `clawvibe qr`:
 
-1. `clawvibe qr` mints a one-time bootstrap token and renders a QR encoding `{url, bootstrapToken, kind: "clawvibe"}`. Show it to the user (the `connect` skill renders the ASCII QR directly in chat). `clawvibe qr --text` prints the setup code for manual entry.
+1. `clawvibe qr` first runs a Tailscale ingress check (warns if the port isn't a TLS-terminated TCP forward — the usual "paired but won't connect" cause), then mints a one-time bootstrap token and renders a QR encoding `{url, bootstrapToken, kind: "clawvibe"}`. Show it to the user (the `connect` skill renders the ASCII QR directly in chat). `clawvibe qr --text` prints the setup code for manual entry.
 2. The user scans it in the ClawVibe iOS app. The server validates the bootstrap token, **auto-approves**, and issues a long-lived device token in the `HelloOk` response — no separate approval step.
 3. On reconnect the app presents the device token. If it falls back to the (already-used) setup code — e.g. after switching servers — the daemon **re-authenticates** the device that code originally paired and re-hands the device token.
 

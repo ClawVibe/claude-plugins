@@ -30,6 +30,9 @@ shift || true
 
 case "$cmd" in
   qr)
+    # Warn (non-blocking) if the Tailscale ingress can't carry WebSockets — the
+    # most common cause of "paired but won't connect".
+    bun "$PLUGIN_DIR/cli.ts" tailscale-check || true
     exec python3 "$PLUGIN_DIR/qr.py" "$@"
     ;;
   setup|install-service|agent|agents)
