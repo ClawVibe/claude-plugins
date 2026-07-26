@@ -174,7 +174,7 @@ clawcode restart spongebob
 ```bash
 clawvibe setup [--apply-tailscale]   # bundle check, link ~/.local/bin/clawvibe, Tailscale check, agents up
 clawvibe agent add <id> --name "Friendly" --emoji 🤖   # writes ~/.claude/agents/<id>.md (+ managed-agents.json)
-clawvibe agents up | down            # start (idempotent) / stop all clawvibe-* sessions
+clawvibe agents up | down | restart  # start (idempotent) / stop all clawvibe-* sessions / full recycle
 clawvibe agent list                  # configured + running/registered status
 clawvibe install-service             # systemd --user unit running `agents up` at login/boot
 ```
@@ -199,4 +199,5 @@ clawvibe install-service             # systemd --user unit running `agents up` a
 - `clawvibe qr` runs the Tailscale ingress check first (warns on a non-TLS-TCP forward before you try to pair).
 - The app's agent list = **confirmed (probe-answered) connected clients** — not the agents folder or managed-agents.json. `install-service`/`agents up` start only the agents in managed-agents.json — not every file in `~/.claude/agents/`.
 - `agents up` launches each as `claude --bg --channels … --agent <id> --permission-mode auto --allowed-tools <reply tools> --name clawvibe-<id>`, **from `$HOME`** (a trusted dir — otherwise the bg session blocks on a directory-trust prompt). The first launch auto-spawns the daemon (detached via `setsid`, so it survives agent restarts).
+- **Upgrading the plugin needs `agents restart`, not `down` + `up`.** The daemon deliberately **lingers** across agent restarts, and it is a singleton guarded by the port — so a *newer* daemon `exit(0)`s on `EADDRINUSE` rather than taking over. After `claude plugin update`, `agents down && agents up` therefore reattaches the new clients to the **old daemon bundle**, and `/health` keeps reporting the previous version. `agents restart` does down → SIGTERM the daemon from `server.pid` → **confirm `:8791` is actually free** (SIGKILL fallback) → up, then verifies the version now serving matches the plugin the CLI came from and exits non-zero on a mismatch. Beware two decoys when diagnosing this by hand: a `--permission-mode [a-z]+` regex silently truncates `acceptEdits` to `accept`, and process cmdlines don't show an agent's launch flags (the launcher exits after handoff) — read `respawnFlags` in `~/.claude/jobs/<id>/state.json` instead, which is also what `claude respawn` replays.
 - **`--permission-mode auto`, not `acceptEdits`** — a channel agent is unattended, so there is nobody to answer a permission prompt. Valid modes on 2.1.220: `acceptEdits | auto | bypassPermissions | manual | dontAsk | plan`. **Validate any launch-flag change against the CLI before shipping** — an invalid flag makes every spawn fail silently, and with a keep-alive loop that becomes a fork bomb.

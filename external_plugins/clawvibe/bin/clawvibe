@@ -19,6 +19,7 @@ usage: clawvibe <command>
   agent list                     Show configured agents and their status.
   agents up                      Start every configured agent (idempotent).
   agents down                    Stop all clawvibe-* agent sessions.
+  agents restart                 down + stop the gateway daemon + up (use after upgrading).
   install-service                systemd --user unit that runs 'agents up' at login/boot.
   qr [--text] [--no-wait]        Generate a pairing QR code.
   help                           This message.
