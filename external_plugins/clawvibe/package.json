@@ -1,13 +1,14 @@
 {
   "name": "clawvibe-channel",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "bun build channel-client.ts gateway-daemon.ts --target bun --outdir dist",
     "start": "bun dist/channel-client.js",
     "daemon": "bun dist/gateway-daemon.js",
-    "test:storm": "bun test/storm-regression.ts"
+    "test:storm": "bun test/storm-regression.ts",
+    "test:pins": "bun test/pins.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

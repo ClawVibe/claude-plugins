@@ -14222,7 +14222,7 @@ var AGENT_ID = EXPLICIT_AGENT || "default";
 var CONN_ID = `${AGENT_ID}#${randomUUID()}`;
 var DAEMON_PATH = ["gateway-daemon.js", "gateway-daemon.ts"].map((f) => join2(import.meta.dir, f)).find(existsSync) ?? join2(import.meta.dir, "gateway-daemon.ts");
 ensureStateDirs();
-var mcp = new Server({ name: "clawvibe", version: "0.1.1" }, {
+var mcp = new Server({ name: "clawvibe", version: "0.1.2" }, {
   capabilities: {
     tools: {},
     experimental: { "claude/channel": {}, "claude/channel/permission": {} }
@@ -14241,7 +14241,9 @@ var mcp = new Server({ name: "clawvibe", version: "0.1.1" }, {
 ` + `
 ` + `IDENTITY \u2014 on EVERY \`reply\`, set the \`name\` and \`emoji\` parameters to your display name and emoji. The channel uses them to keep your listing current (it never reads any file), so include them every time even if unchanged.
 ` + `
-` + `LIVENESS \u2014 if you receive a message whose conversation_id starts with \`clawvibe:probe\`, it is an automated check, not a user. Immediately \`reply\` to that SAME conversation_id with text \`pong\` and your \`name\`/\`emoji\`. Do not narrate it or tell the user about it.`
+` + `LIVENESS \u2014 if you receive a message whose conversation_id starts with \`clawvibe:probe\`, it is an automated check, not a user. Immediately \`reply\` to that SAME conversation_id with text \`pong\` and your \`name\`/\`emoji\`. Do not narrate it or tell the user about it.
+` + `
+` + `STAY ONLINE \u2014 you are a long-lived channel agent, not a task to complete. After you \`reply\`, your work is NOT finished: go back to waiting for the next device message. End every turn standing by, and never report the conversation or your assignment as done. This matters mechanically, not just stylistically: the runtime reclaims background sessions it considers settled, so an agent that declares itself finished is reaped and drops out of the app, while one that stays standing by is not.`
 });
 var convToRun = new Map;
 var lastSessionKey;
