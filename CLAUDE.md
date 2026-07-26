@@ -101,7 +101,8 @@ clawcode qr              # runs clawvibe qr inside the container
   sudo tailscale serve --https=8791 off
   sudo tailscale serve --bg --tls-terminated-tcp=8791 tcp://localhost:8791
   ```
-  Inside the container this is avoided by running Tailscale in-container; on a host gateway use the TCP-forward form above.
+  Running Tailscale in-container does **not** by itself avoid this — what matters is the *form* of the serve command, wherever it runs. The `clawcrew` Coder template ran Tailscale in-container and still had the broken `--https` form (fixed 2026-07-26). Verify with `tailscale serve status --json`: you want `TCP."8791".TCPForward` + `TerminateTLS`, and **no** `Web` handlers. Watch for a config that persists in tailscaled state and looks correct, but gets clobbered on the next start by a broken line in a `startup_script`/entrypoint.
+  `clawvibe setup --apply-tailscale` and `clawvibe qr` both run this check for you.
 - **`CLAWVIBE_HOSTNAME` must be `127.0.0.1`**, not `0.0.0.0`. Tailscale serve binds the Tailscale IP on the plugin port; `0.0.0.0` conflicts. The supervisor sets this in the subprocess env.
 - **Deps are bundled — run `bun run build` after changing source.** `start`/`daemon` run the committed `dist/*.js`, which inline `@modelcontextprotocol/sdk` (self-contained, so a fresh marketplace install needs no `node_modules`). The `dist/` artifacts are committed and **must be rebuilt** (`bun run build`) and re-committed whenever `channel-client.ts`/`gateway-daemon.ts`/`shared/*` change, or the deployed plugin runs stale code. (Historically, a fresh install with no `node_modules` made the MCP server report `status: "failed"` — bundling fixes that.)
 - **Multi-server token collision (re-auth).** The iOS app stores its device token per *(device, role)*, not per server — so two `operator` servers (e.g. this host gateway + the container SpongeBob) clobber each other's token, and on switch-back the app falls through to its one-time setup/bootstrap token. The daemon therefore **re-authenticates a device from an already-used setup code** (paired bootstrap tokens are kept, not pruned) and re-hands the device token in HelloOk. Without this, reconnect after a server switch gets stuck on "authenticating".
@@ -122,7 +123,7 @@ Process lifecycle (split model):
 - **Inert without an agent**: a session with the plugin enabled but no `--agent`/`CLAWVIBE_AGENT_ID` does not register (avoids a bogus `default` agent in the picker).
 
 ### Agent idle-stop & waking
-- **Idle-stop**: Claude Code's agent-view supervisor stops an idle, unattended background session after ~1h. When that happens the channel client dies → the agent **deregisters and drops out of the app**. `install-service` runs `agents up` only at login/boot, so it does **not** counter idle-stop. *(Known gap: a periodic respawn-based heal is not built yet — without it, agents go offline ~1h after their last activity until something re-launches/wakes them.)*
+- **Idle-stop**: Claude Code's agent-view supervisor stops an idle, unattended background session after ~1h. When that happens the channel client dies → the agent **deregisters and drops out of the app**. `install-service` (or a Coder `startup_script`) runs `agents up` only at login/boot/workspace-start, so it does **not** counter idle-stop. *(Known gap: a periodic respawn-based heal is not built yet — without it, agents go offline ~1h after their last activity until something re-launches/wakes them.)*
 - **Waking (preferred over relaunch)**: `claude respawn <id>` is the **non-interactive** wake (`claude attach <id>` is the interactive one). Verified: it **keeps the same session id**, restores the session's saved `--channels` config so the client **re-registers and re-answers the probe**, and **preserves the conversation** — strictly better than a fresh `claude --bg` (blank session, new id). `claude agents --json --all` lists `stopped`/`done` sessions so a healer can find and `respawn` them.
 
 ## Development
@@ -146,6 +147,22 @@ clawvibe agents up | down            # start (idempotent) / stop all clawvibe-* 
 clawvibe agent list                  # configured + running/registered status
 clawvibe install-service             # systemd --user unit running `agents up` at login/boot
 ```
+
+- **`install-service` requires a real user systemd session — it does NOT work in most
+  containers.** It writes a `systemd --user` unit, so it needs a user D-Bus session. In a
+  **Coder workspace** (and `ubuntu-clawcode`) PID 1 is the supervising agent, not systemd:
+  `/sbin/init` and `systemctl` exist in the image, so it *looks* supported, but
+  `systemctl --user` fails and the install silently gets nowhere — the giveaway is that
+  `~/.config/systemd/user/` is never created. Use the platform's own start hook instead:
+  - **Coder workspace** → the template's `coder_agent.startup_script` (re-runs on every
+    workspace start; with `restart = "unless-stopped"` it survives host reboots). Bound it,
+    because `startup_script_behavior = "blocking"` gates workspace readiness:
+    ```bash
+    export PATH="$HOME/.local/bin:$PATH"   # startup_script is a non-login shell
+    timeout 120 clawvibe agents up || echo "[startup] failed (is claude authenticated?)"
+    ```
+  - **ClawCode container** → `bin/entrypoint.sh`.
+  - **A normal Linux login session** → `install-service` is correct and works.
 
 - Managed-agent config: `$CLAWVIBE_STATE_DIR/managed-agents.json` (`[{id, model?}]`). The `.md` `name:` MUST equal the id/slug (routing/`--agent`); `--name`/`--emoji` are **baked into the prompt body** so the agent reports them on every reply (the gateway gets identity from replies, not the file).
 - `clawvibe qr` runs the Tailscale ingress check first (warns on a non-TLS-TCP forward before you try to pair).
