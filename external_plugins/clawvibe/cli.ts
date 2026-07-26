@@ -46,8 +46,27 @@ function writeConfig(a: ManagedAgent[]): void {
   writeFileSync(CONFIG, JSON.stringify(a, null, 2))
 }
 
-async function sh(cmd: string[], cwd?: string): Promise<{ code: number; out: string; err: string }> {
-  const p = Bun.spawn({ cmd, stdout: 'pipe', stderr: 'pipe', ...(cwd ? { cwd } : {}) })
+/**
+ * Identity that must never be inherited by a spawned agent.
+ *
+ * An inherited env var can only tell you what the PARENT was, never what you are. If
+ * `clawvibe agents up` is itself run from inside a Claude session (which is normal — a
+ * session, a hook, or the gateway daemon, which inherits the env of whichever client
+ * spawned it), these leak into every agent we launch. `--agent` currently wins, but
+ * relying on that is exactly the assumption that produced the register/eviction storm,
+ * where CLAUDE_CODE_AGENT was treated as a session identity it never was. Scrub rather
+ * than assume; the leak can also originate from a sibling's launch, not ours.
+ */
+const INHERITED_IDENTITY_VARS = ['CLAUDE_CODE_AGENT', 'CLAWVIBE_AGENT_ID', 'CLAUDE_CODE_SESSION_ID']
+
+function scrubbedEnv(): Record<string, string | undefined> {
+  const env = { ...process.env }
+  for (const k of INHERITED_IDENTITY_VARS) delete env[k]
+  return env
+}
+
+async function sh(cmd: string[], cwd?: string, env?: Record<string, string | undefined>): Promise<{ code: number; out: string; err: string }> {
+  const p = Bun.spawn({ cmd, stdout: 'pipe', stderr: 'pipe', ...(cwd ? { cwd } : {}), ...(env ? { env } : {}) })
   const out = await new Response(p.stdout).text()
   const err = await new Response(p.stderr).text()
   const code = await p.exited
@@ -218,7 +237,8 @@ async function cmdAgentsUp(): Promise<number> {
     ]
     // Launch from $HOME (a trusted dir) so the bg session doesn't block on a
     // directory-trust prompt; a channel agent has no project-specific cwd.
-    const { code, err } = await sh(cmd, homedir())
+    // Identity vars are scrubbed so the new agent cannot inherit ours.
+    const { code, err } = await sh(cmd, homedir(), scrubbedEnv())
     if (code !== 0) { console.log(C.err(`  ${a.id}: failed (${err.trim().slice(0, 120)})`)); continue }
     started++
     const id = await resolveIdByName(name)
