@@ -18,10 +18,16 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync
 import { homedir } from 'os'
 import { join } from 'path'
 import { STATE_DIR, PORT } from './shared/access.ts'
+import { syncPins, readPins } from './shared/pins.ts'
 
 const PLUGIN_DIR = import.meta.dir
 const AGENTS_DIR = join(homedir(), '.claude', 'agents')
 const CONFIG = join(STATE_DIR, 'managed-agents.json')
+// Desired state, distinct from liveness. `agents down` is an operator decision that a
+// keep-alive loop must not undo, so it is recorded here as well as unpinned. (Unpinning
+// alone is not enough in the other direction either: the runtime's own 60s sweep
+// respawns pinned-but-stale sessions, so "stay down" is a two-place write.)
+const PAUSED = join(STATE_DIR, 'paused.json')
 const LOCAL_BIN = join(homedir(), '.local', 'bin', 'clawvibe')
 const UNIT_PATH = join(homedir(), '.config', 'systemd', 'user', 'clawvibe-agents.service')
 const CHANNEL = 'plugin:clawvibe@clawvibe-plugins'
@@ -57,6 +63,46 @@ async function runningByName(): Promise<Record<string, any>> {
     for (const s of arr) if (s?.name) m[s.name] = s
     return m
   } catch { return {} }
+}
+
+/**
+ * Resolve a just-launched session's short id from the roster by its stable `--name`.
+ *
+ * Deliberately NOT parsed from `claude --bg` stdout: that line is undocumented,
+ * ANSI-coloured, and free to change, and mis-parsing it means every keep-alive tick
+ * sees a dead id and destructively replaces a live agent. The roster is structured and
+ * version-independent. It is written asynchronously though, so poll briefly; and a
+ * duplicate name must be an error, not a coin flip — adopting the wrong session is a
+ * worse failure than not resolving at all.
+ */
+async function resolveIdByName(name: string, tries = 6): Promise<string | undefined> {
+  for (let i = 0; i < tries; i++) {
+    const { out } = await sh(['claude', 'agents', '--json'])
+    try {
+      const matches = (JSON.parse(out) as any[]).filter(s => s?.name === name && s?.id)
+      if (matches.length > 1) {
+        console.log(C.err(`    ambiguous: ${matches.length} sessions named "${name}" — refusing to guess`))
+        return undefined
+      }
+      if (matches.length === 1) return matches[0].id as string
+    } catch { /* roster not ready or malformed — retry */ }
+    await new Promise(r => setTimeout(r, 200 * (i + 1)))
+  }
+  return undefined
+}
+
+function readPaused(): string[] {
+  try {
+    const v = JSON.parse(readFileSync(PAUSED, 'utf8')) as unknown
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+  } catch { return [] }
+}
+
+function writePaused(ids: string[]): void {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    writeFileSync(PAUSED, JSON.stringify([...new Set(ids)], null, 2))
+  } catch (err) { console.log(C.err(`  could not record paused state: ${err}`)) }
 }
 
 function parseFlags(args: string[]): { positional: string[]; flags: Record<string, string | true> } {
@@ -131,12 +177,16 @@ async function cmdAgentList(): Promise<number> {
     const r = await fetch(`http://127.0.0.1:${PORT}/agents`, { signal: AbortSignal.timeout(2000) })
     registered = new Set((await r.json() as any[]).map(a => a.id))
   } catch {}
+  const pins = new Set(await readPins())
+  const paused = new Set(readPaused())
   console.log(`managed agents (${cfg.length}):`)
   for (const a of cfg) {
     const sess = running[`clawvibe-${a.id}`]
-    const run = sess ? C.ok('running') : C.warn('stopped')
+    const run = sess ? C.ok('running') : (paused.has(a.id) ? C.dim('paused') : C.warn('stopped'))
     const reg = registered.has(a.id) ? C.ok('registered') : C.dim('not registered')
-    console.log(`  ${a.id}${a.model ? C.dim(' [' + a.model + ']') : ''}  ${run}  ${reg}`)
+    // Unpinned + running is the silent failure: fine now, gone in ~1h.
+    const pin = sess ? (pins.has(sess.id) ? C.ok('pinned') : C.err('UNPINNED — will idle-stop')) : C.dim('—')
+    console.log(`  ${a.id}${a.model ? C.dim(' [' + a.model + ']') : ''}  ${run}  ${reg}  ${pin}`)
   }
   return 0
 }
@@ -148,33 +198,64 @@ async function cmdAgentsUp(): Promise<number> {
   if (cfg.length === 0) { console.log(C.dim('no managed agents configured')); return 0 }
   const running = await runningByName()
   let started = 0, skipped = 0
+  const toPin: string[] = []
   for (const a of cfg) {
-    if (running[`clawvibe-${a.id}`]) { skipped++; console.log(C.dim(`  ${a.id}: already running`)); continue }
+    const name = `clawvibe-${a.id}`
+    const live = running[name]
+    if (live) {
+      // Already up — but it may predate pinning, or have been unpinned by `agents down`.
+      // Pin maintenance belongs in the spawn path, so make it idempotent here too.
+      skipped++
+      if (live.id) toPin.push(live.id)
+      console.log(C.dim(`  ${a.id}: already running`))
+      continue
+    }
     const cmd = [
       'claude', '--bg', '--channels', CHANNEL, '--agent', a.id,
       '--permission-mode', 'acceptEdits', '--allowed-tools', ...REPLY_TOOLS,
       ...(a.model ? ['--model', a.model] : []),
-      '--name', `clawvibe-${a.id}`, SEED,
+      '--name', name, SEED,
     ]
     // Launch from $HOME (a trusted dir) so the bg session doesn't block on a
     // directory-trust prompt; a channel agent has no project-specific cwd.
     const { code, err } = await sh(cmd, homedir())
-    if (code === 0) { started++; console.log(C.ok(`  ${a.id}: started`)) }
-    else console.log(C.err(`  ${a.id}: failed (${err.trim().slice(0, 120)})`))
+    if (code !== 0) { console.log(C.err(`  ${a.id}: failed (${err.trim().slice(0, 120)})`)); continue }
+    started++
+    const id = await resolveIdByName(name)
+    if (id) { toPin.push(id); console.log(C.ok(`  ${a.id}: started`) + C.dim(` (${id})`)) }
+    else console.log(C.ok(`  ${a.id}: started`) + C.warn(' (id unresolved — will not be pinned, so it will idle-stop in ~1h)'))
   }
-  console.log(`agents up — ${started} started, ${skipped} already running`)
+
+  // Pin last, in one locked read-modify-write, so a slow/contended pins.json costs
+  // one lock acquisition rather than one per agent. Best-effort: never fails the command.
+  if (toPin.length > 0) await syncPins({ add: toPin })
+
+  // Explicitly bringing agents up clears any operator "stay down" decision.
+  const stillPaused = readPaused().filter(id => !cfg.some(a => a.id === id))
+  if (stillPaused.length !== readPaused().length) writePaused(stillPaused)
+
+  console.log(`agents up — ${started} started, ${skipped} already running, ${toPin.length} pinned`)
   return 0
 }
 
 async function cmdAgentsDown(): Promise<number> {
   const running = await runningByName()
   let stopped = 0
+  const toUnpin: string[] = []
+  const paused = new Set(readPaused())
   for (const [name, sess] of Object.entries(running)) {
     if (!name.startsWith('clawvibe-')) continue
     await sh(['claude', 'stop', sess.id])
-    stopped++; console.log(C.dim(`  stopped ${name}`))
+    stopped++
+    if (sess.id) toUnpin.push(sess.id)
+    paused.add(name.slice('clawvibe-'.length))
+    console.log(C.dim(`  stopped ${name}`))
   }
-  console.log(`agents down — ${stopped} stopped (daemon lingers)`)
+  // Unpinning is not optional here: a pinned session is respawned by the runtime's own
+  // 60s sweep, so stopping without unpinning means it comes straight back.
+  if (toUnpin.length > 0) await syncPins({ remove: toUnpin })
+  writePaused([...paused])
+  console.log(`agents down — ${stopped} stopped, ${toUnpin.length} unpinned (daemon lingers)`)
   return 0
 }
 
