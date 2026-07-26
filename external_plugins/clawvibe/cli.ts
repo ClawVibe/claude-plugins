@@ -32,7 +32,13 @@ const LOCAL_BIN = join(homedir(), '.local', 'bin', 'clawvibe')
 const UNIT_PATH = join(homedir(), '.config', 'systemd', 'user', 'clawvibe-agents.service')
 const CHANNEL = 'plugin:clawvibe@clawvibe-plugins'
 const REPLY_TOOLS = ['mcp__plugin_clawvibe_clawvibe__reply', 'mcp__plugin_clawvibe_clawvibe__edit_message']
-const SEED = 'You are online as a ClawVibe channel agent. Wait for device messages; when one arrives, reply to it using the clawvibe reply tool. Take no other action until a message arrives.'
+// The "never finished" wording is load-bearing, not politeness. Claude Code's bg daemon
+// reaps sessions it considers SETTLED after an idle TTL; a session that is waiting for
+// input is never a candidate. Two agents on this same seed diverged — one ended a turn
+// reporting "both replies sent" (settled → reaped ~60 min later), the other "standing by
+// for ClawVibe device message" (survived indefinitely). Pinning covers the settled case,
+// but keeping the agent in a waiting state is what makes survival deterministic.
+const SEED = 'You are online as a ClawVibe channel agent. Wait for device messages; when one arrives, reply to it using the clawvibe reply tool, then go straight back to waiting. This is a standing assignment, not a task: you are never finished, so always end your turn standing by rather than reporting your work complete. Take no other action while waiting.'
 
 type ManagedAgent = { id: string; model?: string }
 
@@ -157,7 +163,8 @@ function writeAgentDef(id: string, name: string | undefined, emoji: string | und
   const channel =
     `\n\n## ClawVibe channel\n` +
     `Your display name is "${display}" and your emoji is ${em}. On EVERY \`reply\`, set the \`name\` ("${display}") and \`emoji\` (${em}) parameters.\n` +
-    `When a device message arrives (a \`<channel source="clawvibe" conversation_id="...">\` tag), reply to it with the \`reply\` tool using that conversation_id. Take no other action unless asked.\n`
+    `When a device message arrives (a \`<channel source="clawvibe" conversation_id="...">\` tag), reply to it with the \`reply\` tool using that conversation_id. Take no other action unless asked.\n` +
+    `After replying, return to standing by. You are a long-lived channel agent, never a finished task — do not report your work as complete, or the runtime will reclaim this session and you will drop out of the app.\n`
   writeFileSync(path, fm.join('\n') + persona + channel)
   return true
 }

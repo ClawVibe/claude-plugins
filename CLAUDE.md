@@ -122,7 +122,26 @@ Process lifecycle (split model):
 - **Client stdin close → exit**: the per-session `channel-client` (not the daemon) exits when its Claude session ends; it deregisters from the daemon.
 - **Inert without an agent**: a session with the plugin enabled but no `--agent`/`CLAWVIBE_AGENT_ID` does not register (avoids a bogus `default` agent in the picker).
 
-### Keeping agents alive: PINNING is the mechanism
+### Keeping agents alive #1: NEVER LET THE AGENT SETTLE
+
+The bg daemon's reaper is `retireIfSettled` — it only ever considers **settled** sessions. A session that is **waiting for input is not a candidate at all**, pinned or not. Measured: an unpinned, never-prompted session survived 147 min (2.5× the TTL) untouched.
+
+So the dominant factor is the agent's own end-of-turn state. Two agents on the identical seed prompt diverged:
+
+```
+state=done     detail="both replies sent to device messages"     → settled → reaped ~60 min later
+state=working  detail="standing by for ClawVibe device message"  → not settled → survived
+```
+
+That coin flip is why agents seemed to die unpredictably. The prompts therefore tell the agent, in three places, that it is a **standing assignment and never a finished task** — always end a turn standing by:
+
+- `channel-client.ts` MCP `instructions` (reaches every channel session immediately — the widest coverage, and the only one that helps agents whose `.md` predates the change);
+- `cli.ts` `SEED` (applied on every `agents up` launch);
+- `cli.ts` `writeAgentDef` channel block (new agent definitions only — **existing `.md` files are never overwritten**).
+
+Treat that wording as load-bearing, not stylistic. If you reword it, keep "never finished / end standing by".
+
+### Keeping agents alive #2: PINNING (insurance for when they do settle)
 
 Claude Code's bg daemon sweeps every 60s and retires background sessions whose last input is older than a **60-minute TTL**. The check short-circuits in order: `attached` → `host-managed` → **`pinned`** → idle-TTL. So a **pinned session is exempt from the reaper outright**, and the same sweep additionally respawns pinned sessions that have gone stale — the runtime does keep-alive *for us*, but only for pinned ids.
 
