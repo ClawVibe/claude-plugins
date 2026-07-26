@@ -47,7 +47,7 @@ ensureStateDirs()
 // ── MCP server + tools ─────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: 'clawvibe', version: '0.1.2' },
+  { name: 'clawvibe', version: '0.1.3' },
   {
     capabilities: {
       tools: {},

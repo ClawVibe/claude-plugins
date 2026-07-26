@@ -238,7 +238,11 @@ async function cmdAgentsUp(): Promise<number> {
     }
     const cmd = [
       'claude', '--bg', '--channels', CHANNEL, '--agent', a.id,
-      '--permission-mode', 'acceptEdits', '--allowed-tools', ...REPLY_TOOLS,
+      // `auto`, not `acceptEdits`: a channel agent runs unattended, so there is nobody
+      // to answer a prompt. Valid modes on 2.1.220 are acceptEdits | auto |
+      // bypassPermissions | manual | dontAsk | plan — verified against the CLI before
+      // changing, since an invalid launch flag makes every spawn fail silently.
+      '--permission-mode', 'auto', '--allowed-tools', ...REPLY_TOOLS,
       ...(a.model ? ['--model', a.model] : []),
       '--name', name, SEED,
     ]
