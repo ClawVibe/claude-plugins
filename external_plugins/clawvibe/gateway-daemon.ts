@@ -78,13 +78,49 @@ process.on('unhandledRejection', err => {
 
 // ── Agent registry (IPC) ──────────────────────────────────────────────────────
 
-type SockState = { decode: (chunk: Uint8Array) => void; agentId?: string }
+type SockState = { decode: (chunk: Uint8Array) => void; agentId?: string; connId?: string }
 // identity + confirmed are learned from the agent's replies, not from registration:
 // an agent is listed to the app only once it has answered a probe (confirmed), and
 // its name/emoji are refreshed from every reply (so mid-flight changes propagate).
-type AgentConn = { agentId: string; identity?: AgentIdentity; sock: Socket<SockState>; registeredAt: number; confirmed: boolean; lastProbeAt: number }
+type AgentConn = {
+  connId: string
+  agentId: string
+  identity?: AgentIdentity
+  sock: Socket<SockState>
+  registeredAt: number
+  confirmed: boolean
+  lastProbeAt: number
+  probeCount: number
+}
 
-const agentClients = new Map<string, AgentConn>() // keyed by agentId, insertion-ordered
+// Keyed by connId (unique per client PROCESS), NOT by agentId. agentId is the agent
+// *type* and collides between concurrent sessions; keying on it made each new client
+// evict the incumbent, whose instant reconnect evicted the newcomer, forever.
+// Several clients may therefore share one agentId — resolve via connForAgent().
+const agentClients = new Map<string, AgentConn>()
+
+/** Newest live connection for an agent id, preferring a confirmed one. */
+function connForAgent(agentId: string): AgentConn | undefined {
+  let best: AgentConn | undefined
+  for (const c of agentClients.values()) {
+    if (c.agentId !== agentId) continue
+    if (!best || (c.confirmed && !best.confirmed) || (c.confirmed === best.confirmed && c.registeredAt > best.registeredAt)) {
+      best = c
+    }
+  }
+  return best
+}
+
+/** One entry per agentId (newest confirmed connection), for app-facing listings. */
+function confirmedAgents(): AgentConn[] {
+  const byAgent = new Map<string, AgentConn>()
+  for (const c of agentClients.values()) {
+    if (!c.confirmed) continue
+    const prev = byAgent.get(c.agentId)
+    if (!prev || c.registeredAt > prev.registeredAt) byAgent.set(c.agentId, c)
+  }
+  return [...byAgent.values()]
+}
 
 function writeIpc(sock: Socket<SockState>, frame: IpcFrame): void {
   try { sock.write(encodeFrame(frame)) } catch (err) {
@@ -105,6 +141,7 @@ function probeAgent(conn: AgentConn): void {
   const sessionKey = `clawvibe:probe:${nonce}`
   const runId = nextMsgId()
   conn.lastProbeAt = Date.now()
+  conn.probeCount++
   writeIpc(conn.sock, {
     v: 1, t: 'inbound', sessionKey, runId,
     text: `[CLAWVIBE_PING ${nonce}] automated liveness check — reply "pong" to this conversation with your name and emoji.`,
@@ -116,25 +153,38 @@ function probeAgent(conn: AgentConn): void {
 function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
   switch (frame.t) {
     case 'register': {
-      const { agentId } = frame
-      const prev = agentClients.get(agentId)
-      if (prev && prev.sock !== sock) {
-        // Last-writer-wins: a fresh client for the same agent replaces the stale one.
-        process.stderr.write(`clawvibe-daemon: replacing stale client for agent=${agentId}\n`)
-        try { prev.sock.end() } catch {}
-      }
+      const { agentId, connId } = frame
+      // NO eviction: a duplicate agentId is a legitimate second session, not a stale
+      // client. Ending the incumbent here (and its instant reconnect) was the storm.
+      // Re-registration of the SAME connId is the same process reconnecting, so carry
+      // its confirmation + identity forward rather than forcing a re-probe.
+      const prev = agentClients.get(connId)
       sock.data.agentId = agentId
-      const conn: AgentConn = { agentId, sock, registeredAt: Date.now(), confirmed: false, lastProbeAt: 0 }
-      agentClients.set(agentId, conn)
+      sock.data.connId = connId
+      const conn: AgentConn = {
+        connId,
+        agentId,
+        sock,
+        registeredAt: Date.now(),
+        confirmed: prev?.confirmed ?? false,
+        identity: prev?.identity,
+        lastProbeAt: prev?.lastProbeAt ?? 0,
+        probeCount: prev?.probeCount ?? 0,
+      }
+      agentClients.set(connId, conn)
       writeIpc(sock, { v: 1, t: 'register.ok', agentId })
-      process.stderr.write(`clawvibe-daemon: agent registered id=${agentId} (probing for confirmation)\n`)
-      probeAgent(conn)
+      if (conn.confirmed) {
+        process.stderr.write(`clawvibe-daemon: agent re-registered id=${agentId} conn=${connId} (already confirmed)\n`)
+      } else {
+        process.stderr.write(`clawvibe-daemon: agent registered id=${agentId} conn=${connId} (probing for confirmation)\n`)
+        probeAgent(conn)
+      }
       return
     }
     case 'reply': {
       // Refresh identity + confirm liveness from ANY reply (incl. mid-flight changes).
-      const agentId = sock.data?.agentId
-      const conn = agentId ? agentClients.get(agentId) : undefined
+      const connId = sock.data?.connId
+      const conn = connId ? agentClients.get(connId) : undefined
       if (conn) {
         if (frame.name !== undefined || frame.emoji !== undefined) {
           conn.identity = {
@@ -177,10 +227,10 @@ function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
 }
 
 function onIpcClose(sock: Socket<SockState>): void {
-  const agentId = sock.data?.agentId
-  if (agentId && agentClients.get(agentId)?.sock === sock) {
-    agentClients.delete(agentId)
-    process.stderr.write(`clawvibe-daemon: agent deregistered id=${agentId}\n`)
+  const connId = sock.data?.connId
+  if (connId && agentClients.get(connId)?.sock === sock) {
+    agentClients.delete(connId)
+    process.stderr.write(`clawvibe-daemon: agent deregistered id=${sock.data?.agentId} conn=${connId}\n`)
   }
 }
 
@@ -306,7 +356,7 @@ setInterval(() => {
 
 function routeInbound(sessionKey: string, runId: string, text: string, meta: InboundMeta): boolean {
   const agentId = agentIdFromSessionKey(sessionKey) ?? pickFallbackAgentId()
-  const conn = agentId ? agentClients.get(agentId) : undefined
+  const conn = agentId ? connForAgent(agentId) : undefined
   if (!conn) {
     process.stderr.write(`clawvibe-daemon: no agent for session=${sessionKey} (agentId=${agentId})\n`)
     return false
@@ -483,18 +533,27 @@ function handleHealth(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   sendFrame(ws, { type: 'res', id: req.id, ok: true, payload: { ok: true } })
 }
 
-// Throttled lazy re-probe of connected-but-unconfirmed agents (decision: probe on
-// register + reconfirm lazily when the app asks for the list).
+// Lazy re-probe of connected-but-unconfirmed agents (decision: probe on register +
+// reconfirm lazily when the app asks for the list). Backed off per connection and
+// capped: every probe costs the agent a real inference turn, so a client that never
+// answers (e.g. the plugin loaded without --channels) must not be probed forever.
+const REPROBE_BASE_MS = 5_000
+const REPROBE_MAX_MS = 300_000
+const REPROBE_GIVE_UP_MS = 60 * 60 * 1000
+
 function reprobeUnconfirmed(): void {
   const now = Date.now()
   for (const c of agentClients.values()) {
-    if (!c.confirmed && now - c.lastProbeAt > 5000) probeAgent(c)
+    if (c.confirmed) continue
+    if (now - c.registeredAt > REPROBE_GIVE_UP_MS) continue
+    const interval = Math.min(REPROBE_BASE_MS * 2 ** c.probeCount, REPROBE_MAX_MS)
+    if (now - c.lastProbeAt > interval) probeAgent(c)
   }
 }
 
 function handleAgentsList(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   reprobeUnconfirmed()
-  const agents = [...agentClients.values()].filter(c => c.confirmed)
+  const agents = confirmedAgents()
   const defaultId = agents.length > 0 ? agents[0].agentId : 'default'
   sendFrame(ws, {
     type: 'res', id: req.id, ok: true,
@@ -516,7 +575,7 @@ function handleAgentsList(ws: ServerWebSocket<WSData>, req: RequestFrame): void 
 function handleAgentIdentityGet(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   const params = req.params ?? {}
   const agentId = (params.agentId as string) ?? 'default'
-  const c = agentClients.get(agentId)
+  const c = connForAgent(agentId)
   if (!c || !c.confirmed) {
     sendFrame(ws, { type: 'res', id: req.id, ok: false, error: { message: `agent not found: ${agentId}` } })
     return
@@ -603,7 +662,7 @@ function startHttpServer() {
       // Agent discovery (HTTP) — confirmed (probe-answered) agents only.
       if (url.pathname === '/agents' && req.method === 'GET') {
         reprobeUnconfirmed()
-        const agents = [...agentClients.values()].filter(c => c.confirmed).map(c => ({
+        const agents = confirmedAgents().map(c => ({
           id: c.agentId, name: c.identity?.name ?? c.agentId, emoji: c.identity?.emoji ?? null,
         }))
         return Response.json(agents)

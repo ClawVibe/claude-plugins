@@ -13,6 +13,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { randomUUID } from 'crypto'
 import { existsSync } from 'fs'
 import { join } from 'path'
 import type { Socket } from 'bun'
@@ -30,6 +31,10 @@ import {
 // pollute the picker and fight other such sessions for the "default" id.
 const EXPLICIT_AGENT = process.env.CLAUDE_CODE_AGENT || process.env.CLAWVIBE_AGENT_ID || ''
 const AGENT_ID = EXPLICIT_AGENT || 'default'
+// Connection identity: unique per client PROCESS, stable across its reconnects.
+// AGENT_ID alone is the agent *type* and collides between concurrent sessions —
+// keying the daemon registry on it made two clients evict each other forever.
+const CONN_ID = `${AGENT_ID}#${randomUUID()}`
 // Resolve the daemon next to the running file — `.js` when bundled into dist/,
 // `.ts` when running from source.
 const DAEMON_PATH =
@@ -137,30 +142,51 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 })
 
 function deliverInbound(text: string, meta: InboundMeta): void {
+  // The host validates params as { content: string, meta: record(string, string) }.
+  // A single non-string (e.g. an absent device_name) fails validation and the WHOLE
+  // notification is dropped silently — so coerce every value and omit empties.
+  const m: Record<string, string> = {}
+  const put = (k: string, v: unknown): void => {
+    if (v !== undefined && v !== null) m[k] = typeof v === 'string' ? v : String(v)
+  }
+  put('source', 'clawvibe')
+  put('chat_id', meta.conversation_id)
+  put('message_id', meta.message_id)
+  put('user', meta.device_name)
+  put('ts', meta.ts)
+  put('device_id', meta.device_id)
+  put('conversation_id', meta.conversation_id)
+  put('context', meta.context)
+  put('location', meta.location)
+  if (meta.voice_data !== undefined && meta.voice_data !== null) {
+    try { put('voice_data', JSON.stringify(meta.voice_data)) } catch {}
+  }
+  put('thinking', meta.thinking)
+  put('timeout_ms', meta.timeout_ms)
+
   mcp.notification({
     method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        source: 'clawvibe',
-        chat_id: meta.conversation_id,
-        message_id: meta.message_id,
-        user: meta.device_name,
-        ts: meta.ts,
-        device_id: meta.device_id,
-        conversation_id: meta.conversation_id,
-        ...(meta.context ? { context: meta.context } : {}),
-        ...(meta.location ? { location: meta.location } : {}),
-        ...(meta.voice_data ? { voice_data: JSON.stringify(meta.voice_data) } : {}),
-        ...(meta.thinking ? { thinking: meta.thinking } : {}),
-        ...(meta.timeout_ms ? { timeout_ms: String(meta.timeout_ms) } : {}),
-      },
-    },
+    params: { content: text, meta: m },
   }).catch(err => process.stderr.write(`clawvibe-client: notification failed: ${err}\n`))
 }
 
+// Cap on retained conversation→run correlations. Bounded so a long-lived client
+// (or a burst of probes) can't grow the heap without limit.
+const CONV_TO_RUN_MAX = 256
+
 function onInbound(frame: IpcInbound): void {
-  convToRun.set(frame.sessionKey, frame.runId)
+  // Never retain probe keys: each probe mints a fresh unique sessionKey, so keeping
+  // them leaked a Map entry per probe. Probe replies are not device-facing anyway.
+  if (!frame.sessionKey.startsWith('clawvibe:probe')) {
+    convToRun.set(frame.sessionKey, frame.runId)
+    while (convToRun.size > CONV_TO_RUN_MAX) {
+      const oldest = convToRun.keys().next().value
+      if (oldest === undefined) break
+      convToRun.delete(oldest)
+    }
+  }
+  // Tracked for probes too, so a `reply` that omits conversation_id still lands on
+  // the probe conversation (confirming liveness) instead of leaking to a device.
   lastSessionKey = frame.sessionKey
   deliverInbound(frame.text, frame.meta)
 }
@@ -176,6 +202,8 @@ function sendIpc(frame: IpcFrame): void {
     process.stderr.write(`clawvibe-client: ipc write failed: ${err}\n`)
   }
 }
+
+let daemonSpawned = false
 
 function spawnDaemon(): void {
   // Launch via `setsid` so the daemon runs in its own session, fully detached
@@ -200,36 +228,59 @@ function spawnDaemon(): void {
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
+const RECONNECT_BASE_MS = 250
+const RECONNECT_MAX_MS = 10_000
+
+// Guards against overlapping connect loops: `close` fires asynchronously, so two
+// loops could otherwise interleave and orphan sockets (the single global `sock`
+// was overwritten without ending the previous one).
+let connecting = false
+let backoffMs = RECONNECT_BASE_MS
+
 async function connectDaemon(): Promise<void> {
-  for (let attempt = 0; attempt < 15 && !shuttingDown; attempt++) {
-    try {
-      sock = await Bun.connect<{ decode: (c: Uint8Array) => void }>({
-        unix: SOCK_FILE,
-        socket: {
-          open(s) {
-            s.data = { decode: makeLineDecoder(f => { if (f.t === 'inbound') onInbound(f) }) }
+  if (connecting || shuttingDown) return
+  connecting = true
+  try {
+    for (let attempt = 0; attempt < 15 && !shuttingDown; attempt++) {
+      try {
+        // Never leak a previous socket when re-entering the loop.
+        if (sock) { try { sock.end() } catch {} ; sock = null }
+        sock = await Bun.connect<{ decode: (c: Uint8Array) => void }>({
+          unix: SOCK_FILE,
+          socket: {
+            open(s) {
+              s.data = { decode: makeLineDecoder(f => { if (f.t === 'inbound') onInbound(f) }) }
+            },
+            data(s, data) { s.data.decode(data) },
+            close() {
+              sock = null
+              if (!shuttingDown) {
+                process.stderr.write('clawvibe-client: daemon connection closed; reconnecting\n')
+                // Delayed + jittered: an immediate reconnect here was half of the
+                // mutual-eviction storm (the other half was daemon-side eviction).
+                setTimeout(() => void connectDaemon(), RECONNECT_BASE_MS + Math.random() * RECONNECT_BASE_MS)
+              }
+            },
+            error(_s, err) { process.stderr.write(`clawvibe-client: ipc error: ${err}\n`) },
           },
-          data(s, data) { s.data.decode(data) },
-          close() {
-            sock = null
-            if (!shuttingDown) {
-              process.stderr.write('clawvibe-client: daemon connection closed; reconnecting\n')
-              void connectDaemon()
-            }
-          },
-          error(_s, err) { process.stderr.write(`clawvibe-client: ipc error: ${err}\n`) },
-        },
-      })
-      // Register this agent with the daemon.
-      sendIpc({ v: 1, t: 'register', agentId: AGENT_ID, pid: process.pid })
-      process.stderr.write(`clawvibe-client: connected + registered agent=${AGENT_ID} (awaiting probe confirmation)\n`)
-      return
-    } catch {
-      if (attempt === 0) spawnDaemon() // first failure: daemon likely absent
-      await sleep(200)
+        })
+        // Register this agent with the daemon.
+        sendIpc({ v: 1, t: 'register', agentId: AGENT_ID, connId: CONN_ID, pid: process.pid })
+        process.stderr.write(`clawvibe-client: connected + registered agent=${AGENT_ID} conn=${CONN_ID} (awaiting probe confirmation)\n`)
+        backoffMs = RECONNECT_BASE_MS
+        return
+      } catch {
+        // Once per process — retrying the spawn on every reconnect forked a
+        // redundant daemon (which exits(0)) on each attempt.
+        if (!daemonSpawned) { daemonSpawned = true; spawnDaemon() }
+        await sleep(backoffMs + Math.random() * backoffMs * 0.3)
+        backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS)
+      }
     }
+    if (!shuttingDown) process.stderr.write('clawvibe-client: could not reach gateway daemon after retries\n')
+  } finally {
+    connecting = false
   }
-  if (!shuttingDown) process.stderr.write('clawvibe-client: could not reach gateway daemon after retries\n')
 }
 
 // Heartbeat (socket EOF is the primary liveness signal; this is belt-and-braces).
@@ -249,10 +300,15 @@ process.on('unhandledRejection', err => process.stderr.write(`clawvibe-client: u
 
 // ── Start ──────────────────────────────────────────────────────────────────────
 
+// ORDER MATTERS: the MCP transport must be live BEFORE we join the gateway.
+// Registering first meant the daemon's immediate confirmation probe arrived while
+// `_transport` was still null, so `mcp.notification()` threw "Not connected", the
+// probe was lost, the agent was never confirmed, and the app listed zero agents.
+await mcp.connect(new StdioServerTransport())
+process.stderr.write(`clawvibe-client: MCP transport connected (state ${STATE_DIR})\n`)
+
 if (EXPLICIT_AGENT) {
   await connectDaemon()
 } else {
   process.stderr.write('clawvibe-client: no agent id (CLAUDE_CODE_AGENT/CLAWVIBE_AGENT_ID unset) — running inert, not joining the gateway\n')
 }
-await mcp.connect(new StdioServerTransport())
-process.stderr.write(`clawvibe-client: MCP transport connected (state ${STATE_DIR})\n`)
