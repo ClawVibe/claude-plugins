@@ -7,17 +7,19 @@
  *   clawvibe agent rm <id> [--purge]
  *   clawvibe agent list
  *   clawvibe agents up                   idempotently start every configured agent
+ *   clawvibe agents restart              down + stop the gateway daemon + up (use after a plugin upgrade)
  *   clawvibe agents down                 stop all clawvibe-* sessions
  *   clawvibe install-service             systemd --user unit that runs `agents up` at login/boot
  *
  * Managed-agent config: $CLAWVIBE_STATE_DIR/managed-agents.json = [{ id, model? }]
- * Agent identity/persona: ~/.claude/agents/<id>.md (read by channel-client via shared/identity).
+ * Agent identity/persona: ~/.claude/agents/<id>.md — the gateway never reads it; the
+ * agent reports its own name/emoji on every `reply` (see channel-client instructions).
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync, unlinkSync, lstatSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
-import { STATE_DIR, PORT } from './shared/access.ts'
+import { STATE_DIR, PORT, PID_FILE, SOCK_FILE } from './shared/access.ts'
 import { syncPins, readPins } from './shared/pins.ts'
 
 const PLUGIN_DIR = import.meta.dir
@@ -290,6 +292,89 @@ async function cmdAgentsDown(): Promise<number> {
   return 0
 }
 
+// ── agents restart (the upgrade path) ────────────────────────────────────────
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+function pluginVersion(): string | undefined {
+  try {
+    return (JSON.parse(readFileSync(join(PLUGIN_DIR, '.claude-plugin', 'plugin.json'), 'utf8')) as { version?: string }).version
+  } catch { return undefined }
+}
+
+async function daemonHealth(): Promise<{ up: boolean; version?: string }> {
+  try {
+    const r = await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(1500) })
+    if (!r.ok) return { up: false }
+    return { up: true, version: (await r.json() as { version?: string }).version }
+  } catch { return { up: false } }
+}
+
+/**
+ * Stop the gateway daemon and CONFIRM the port is free.
+ *
+ * This is the whole reason `agents restart` exists. The daemon deliberately lingers
+ * across agent restarts (so pairing keeps working), and it is a singleton guarded by
+ * the port — so a *newer* daemon exits(0) on EADDRINUSE rather than taking over. After
+ * a plugin upgrade that means `agents down && agents up` silently reattaches the new
+ * clients to the OLD daemon bundle, and /health keeps reporting the previous version.
+ * Confirming the port is actually free is therefore load-bearing, not politeness.
+ */
+async function stopDaemon(): Promise<void> {
+  let pid = 0
+  try { pid = parseInt(readFileSync(PID_FILE, 'utf8'), 10) } catch { /* no pid file */ }
+  if (Number.isInteger(pid) && pid > 1) {
+    try { process.kill(pid, 'SIGTERM'); console.log(C.dim(`  stopping gateway daemon pid=${pid}`)) } catch { /* already gone */ }
+  } else if ((await daemonHealth()).up) {
+    console.log(C.warn(`  a gateway is answering on :${PORT} but ${PID_FILE} is missing — cannot identify it`))
+  }
+
+  for (let i = 0; i < 20 && (await daemonHealth()).up; i++) await sleep(250)
+
+  if ((await daemonHealth()).up && pid > 1) {
+    console.log(C.warn('  daemon ignored SIGTERM — sending SIGKILL'))
+    try { process.kill(pid, 'SIGKILL') } catch {}
+    for (let i = 0; i < 12 && (await daemonHealth()).up; i++) await sleep(250)
+  }
+
+  const left = await daemonHealth()
+  if (left.up) {
+    // Not necessarily ours: another state dir, user, or container can own :8791.
+    console.log(C.err(`  ⚠ something is STILL serving :${PORT} (version ${left.version ?? '?'}) — agents will attach to it, not to a fresh daemon`))
+  } else {
+    try { if (existsSync(SOCK_FILE)) unlinkSync(SOCK_FILE) } catch {}
+    try { if (existsSync(PID_FILE)) rmSync(PID_FILE) } catch {}
+    console.log(C.dim('  gateway stopped'))
+  }
+}
+
+async function cmdAgentsRestart(): Promise<number> {
+  console.log('agents restart:')
+  await cmdAgentsDown()
+  await stopDaemon()
+  const rc = await cmdAgentsUp()
+
+  // The daemon is spawned by the first agent client, so give it a moment, then check
+  // that the version now serving matches the plugin this CLI was run from. A mismatch
+  // is the stale-daemon trap above and is worth shouting about.
+  for (let i = 0; i < 20 && !(await daemonHealth()).up; i++) await sleep(250)
+  const h = await daemonHealth()
+  const want = pluginVersion()
+  if (!h.up) console.log(C.warn(`  no gateway on :${PORT} yet — it spawns with the first agent client`))
+  else if (want && h.version !== want) {
+    // The daemon is spawned by a channel CLIENT, which comes from the plugin Claude Code
+    // has installed — not from wherever this CLI was run. So a mismatch means one of:
+    //   1. a stale daemon still owns the port (the newer one exit(0)'d on EADDRINUSE), or
+    //   2. the installed plugin is a different version than this CLI (e.g. running a dev
+    //      checkout, or `claude plugin update` hasn't been run yet).
+    console.log(C.err(`  ⚠ gateway is serving ${h.version} but this CLI ships ${want}`))
+    console.log(C.dim(`     either a stale daemon owns :${PORT}, or the installed plugin isn't ${want} yet`))
+    console.log(C.dim(`     check: claude plugin list | grep clawvibe`))
+    return 1
+  } else console.log(C.ok(`  gateway ${h.version ?? '?'} ✓`))
+  return rc
+}
+
 // ── setup ─────────────────────────────────────────────────────────────────────
 
 function linkCli(): void {
@@ -380,7 +465,8 @@ async function main(): Promise<number> {
     case 'agents':
       if (sub === 'up') return cmdAgentsUp()
       if (sub === 'down') return cmdAgentsDown()
-      console.error('usage: clawvibe agents <up|down>'); return 1
+      if (sub === 'restart') return cmdAgentsRestart()
+      console.error('usage: clawvibe agents <up|down|restart>'); return 1
     case 'agent':
       if (sub === 'add') return cmdAgentAdd(rest)
       if (sub === 'rm') return cmdAgentRm(rest)
