@@ -14066,6 +14066,7 @@ class StdioServerTransport {
 }
 
 // channel-client.ts
+import { randomUUID } from "crypto";
 import { existsSync } from "fs";
 import { join as join2 } from "path";
 
@@ -14218,9 +14219,10 @@ function makeLineDecoder(onFrame) {
 // channel-client.ts
 var EXPLICIT_AGENT = process.env.CLAUDE_CODE_AGENT || process.env.CLAWVIBE_AGENT_ID || "";
 var AGENT_ID = EXPLICIT_AGENT || "default";
+var CONN_ID = `${AGENT_ID}#${randomUUID()}`;
 var DAEMON_PATH = ["gateway-daemon.js", "gateway-daemon.ts"].map((f) => join2(import.meta.dir, f)).find(existsSync) ?? join2(import.meta.dir, "gateway-daemon.ts");
 ensureStateDirs();
-var mcp = new Server({ name: "clawvibe", version: "0.1.0" }, {
+var mcp = new Server({ name: "clawvibe", version: "0.1.1" }, {
   capabilities: {
     tools: {},
     experimental: { "claude/channel": {}, "claude/channel/permission": {} }
@@ -14308,30 +14310,44 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 function deliverInbound(text, meta2) {
+  const m = {};
+  const put = (k, v) => {
+    if (v !== undefined && v !== null)
+      m[k] = typeof v === "string" ? v : String(v);
+  };
+  put("source", "clawvibe");
+  put("chat_id", meta2.conversation_id);
+  put("message_id", meta2.message_id);
+  put("user", meta2.device_name);
+  put("ts", meta2.ts);
+  put("device_id", meta2.device_id);
+  put("conversation_id", meta2.conversation_id);
+  put("context", meta2.context);
+  put("location", meta2.location);
+  if (meta2.voice_data !== undefined && meta2.voice_data !== null) {
+    try {
+      put("voice_data", JSON.stringify(meta2.voice_data));
+    } catch {}
+  }
+  put("thinking", meta2.thinking);
+  put("timeout_ms", meta2.timeout_ms);
   mcp.notification({
     method: "notifications/claude/channel",
-    params: {
-      content: text,
-      meta: {
-        source: "clawvibe",
-        chat_id: meta2.conversation_id,
-        message_id: meta2.message_id,
-        user: meta2.device_name,
-        ts: meta2.ts,
-        device_id: meta2.device_id,
-        conversation_id: meta2.conversation_id,
-        ...meta2.context ? { context: meta2.context } : {},
-        ...meta2.location ? { location: meta2.location } : {},
-        ...meta2.voice_data ? { voice_data: JSON.stringify(meta2.voice_data) } : {},
-        ...meta2.thinking ? { thinking: meta2.thinking } : {},
-        ...meta2.timeout_ms ? { timeout_ms: String(meta2.timeout_ms) } : {}
-      }
-    }
+    params: { content: text, meta: m }
   }).catch((err) => process.stderr.write(`clawvibe-client: notification failed: ${err}
 `));
 }
+var CONV_TO_RUN_MAX = 256;
 function onInbound(frame) {
-  convToRun.set(frame.sessionKey, frame.runId);
+  if (!frame.sessionKey.startsWith("clawvibe:probe")) {
+    convToRun.set(frame.sessionKey, frame.runId);
+    while (convToRun.size > CONV_TO_RUN_MAX) {
+      const oldest = convToRun.keys().next().value;
+      if (oldest === undefined)
+        break;
+      convToRun.delete(oldest);
+    }
+  }
   lastSessionKey = frame.sessionKey;
   deliverInbound(frame.text, frame.meta);
 }
@@ -14350,6 +14366,7 @@ function sendIpc(frame) {
 `);
   }
 }
+var daemonSpawned = false;
 function spawnDaemon() {
   const attempts = [
     ["setsid", process.execPath, DAEMON_PATH],
@@ -14369,48 +14386,69 @@ function spawnDaemon() {
   }
 }
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+var RECONNECT_BASE_MS = 250;
+var RECONNECT_MAX_MS = 1e4;
+var connecting = false;
+var backoffMs = RECONNECT_BASE_MS;
 async function connectDaemon() {
-  for (let attempt = 0;attempt < 15 && !shuttingDown; attempt++) {
-    try {
-      sock = await Bun.connect({
-        unix: SOCK_FILE,
-        socket: {
-          open(s) {
-            s.data = { decode: makeLineDecoder((f) => {
-              if (f.t === "inbound")
-                onInbound(f);
-            }) };
-          },
-          data(s, data) {
-            s.data.decode(data);
-          },
-          close() {
-            sock = null;
-            if (!shuttingDown) {
-              process.stderr.write(`clawvibe-client: daemon connection closed; reconnecting
-`);
-              connectDaemon();
-            }
-          },
-          error(_s, err) {
-            process.stderr.write(`clawvibe-client: ipc error: ${err}
-`);
-          }
+  if (connecting || shuttingDown)
+    return;
+  connecting = true;
+  try {
+    for (let attempt = 0;attempt < 15 && !shuttingDown; attempt++) {
+      try {
+        if (sock) {
+          try {
+            sock.end();
+          } catch {}
+          sock = null;
         }
-      });
-      sendIpc({ v: 1, t: "register", agentId: AGENT_ID, pid: process.pid });
-      process.stderr.write(`clawvibe-client: connected + registered agent=${AGENT_ID} (awaiting probe confirmation)
+        sock = await Bun.connect({
+          unix: SOCK_FILE,
+          socket: {
+            open(s) {
+              s.data = { decode: makeLineDecoder((f) => {
+                if (f.t === "inbound")
+                  onInbound(f);
+              }) };
+            },
+            data(s, data) {
+              s.data.decode(data);
+            },
+            close() {
+              sock = null;
+              if (!shuttingDown) {
+                process.stderr.write(`clawvibe-client: daemon connection closed; reconnecting
 `);
-      return;
-    } catch {
-      if (attempt === 0)
-        spawnDaemon();
-      await sleep(200);
+                setTimeout(() => void connectDaemon(), RECONNECT_BASE_MS + Math.random() * RECONNECT_BASE_MS);
+              }
+            },
+            error(_s, err) {
+              process.stderr.write(`clawvibe-client: ipc error: ${err}
+`);
+            }
+          }
+        });
+        sendIpc({ v: 1, t: "register", agentId: AGENT_ID, connId: CONN_ID, pid: process.pid });
+        process.stderr.write(`clawvibe-client: connected + registered agent=${AGENT_ID} conn=${CONN_ID} (awaiting probe confirmation)
+`);
+        backoffMs = RECONNECT_BASE_MS;
+        return;
+      } catch {
+        if (!daemonSpawned) {
+          daemonSpawned = true;
+          spawnDaemon();
+        }
+        await sleep(backoffMs + Math.random() * backoffMs * 0.3);
+        backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS);
+      }
     }
-  }
-  if (!shuttingDown)
-    process.stderr.write(`clawvibe-client: could not reach gateway daemon after retries
+    if (!shuttingDown)
+      process.stderr.write(`clawvibe-client: could not reach gateway daemon after retries
 `);
+  } finally {
+    connecting = false;
+  }
 }
 setInterval(() => {
   if (sock)
@@ -14429,12 +14467,12 @@ process.stdin.on("end", () => onParentGone("stdin closed (parent exited)"));
 process.stdin.on("error", () => onParentGone("stdin error (parent exited)"));
 process.on("unhandledRejection", (err) => process.stderr.write(`clawvibe-client: unhandled rejection: ${err}
 `));
+await mcp.connect(new StdioServerTransport);
+process.stderr.write(`clawvibe-client: MCP transport connected (state ${STATE_DIR})
+`);
 if (EXPLICIT_AGENT) {
   await connectDaemon();
 } else {
   process.stderr.write(`clawvibe-client: no agent id (CLAUDE_CODE_AGENT/CLAWVIBE_AGENT_ID unset) \u2014 running inert, not joining the gateway
 `);
 }
-await mcp.connect(new StdioServerTransport);
-process.stderr.write(`clawvibe-client: MCP transport connected (state ${STATE_DIR})
-`);

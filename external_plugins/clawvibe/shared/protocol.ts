@@ -66,11 +66,18 @@ export const IPC_VERSION = 1
 
 /** client → daemon: announce this agent client. Identity is NOT sent here — the
  *  daemon learns the agent's display name/emoji from its replies (probe + every
- *  reply carries them), and only lists agents that have answered (confirmed). */
+ *  reply carries them), and only lists agents that have answered (confirmed).
+ *
+ *  `connId` is the CONNECTION identity: unique per client process, stable across
+ *  that process's reconnects. `agentId` is the agent *type* (CLAUDE_CODE_AGENT),
+ *  which is NOT unique — two sessions of the same agent collide on it. The daemon
+ *  keys its registry by connId so concurrent sessions coexist instead of evicting
+ *  each other in a reconnect loop. */
 export type IpcRegister = {
   v: 1
   t: 'register'
   agentId: string
+  connId: string
   pid: number
 }
 
