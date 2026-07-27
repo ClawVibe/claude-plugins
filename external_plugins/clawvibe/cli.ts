@@ -311,6 +311,44 @@ async function daemonHealth(): Promise<{ up: boolean; version?: string }> {
   } catch { return { up: false } }
 }
 
+const CACHE_ROOT = join(homedir(), '.claude', 'plugins', 'cache', 'clawvibe-plugins', 'clawvibe') + '/'
+
+/**
+ * Channel clients of THIS user running a DIFFERENT installed version than we are.
+ *
+ * These are what make an upgrade fail: stopping the daemon isn't enough, because a
+ * surviving old-version client's reconnect loop immediately respawns a daemon from its
+ * own (old) plugin dir and wins the port race — so the new clients attach to the old
+ * bundle again and /health keeps reporting the previous version.
+ *
+ * Scoping is deliberately tight, because this kills processes:
+ *   - Linux only (needs /proc for the cwd, which is the only reliable version marker —
+ *     the cmdline is just `bun dist/channel-client.js`, resolved relative to --cwd).
+ *   - Only clients whose cwd is under OUR $HOME's plugin cache. Container processes are
+ *     visible in the host's /proc and can share uid 1000, so a looser match could kill a
+ *     different machine's agents. A source/dev checkout isn't under the cache root either,
+ *     so it is left alone.
+ *   - Only when we ourselves are running from the cache, so "current version" is defined.
+ */
+function staleClientPids(): { pid: number; version: string }[] {
+  const found: { pid: number; version: string }[] = []
+  if (process.platform !== 'linux') return found
+  if (!PLUGIN_DIR.startsWith(CACHE_ROOT)) return found // dev checkout — don't guess
+  const ours = PLUGIN_DIR.slice(CACHE_ROOT.length).split('/')[0]
+  let pids: string[] = []
+  try { pids = readdirSync('/proc').filter(d => /^\d+$/.test(d)) } catch { return found }
+  for (const p of pids) {
+    try {
+      if (!readFileSync(`/proc/${p}/cmdline`, 'utf8').includes('channel-client.js')) continue
+      const cwd = realpathSync(`/proc/${p}/cwd`) + '/'          // EPERM for other users → skipped
+      if (!cwd.startsWith(CACHE_ROOT)) continue
+      const version = cwd.slice(CACHE_ROOT.length).split('/')[0]
+      if (version && version !== ours) found.push({ pid: Number(p), version })
+    } catch { /* process vanished, or not ours to inspect */ }
+  }
+  return found
+}
+
 /**
  * Stop the gateway daemon and CONFIRM the port is free.
  *
@@ -322,6 +360,15 @@ async function daemonHealth(): Promise<{ up: boolean; version?: string }> {
  * Confirming the port is actually free is therefore load-bearing, not politeness.
  */
 async function stopDaemon(): Promise<void> {
+  // Stale clients FIRST: killing the daemon while one is alive just hands it a window to
+  // respawn the old bundle. Their sessions (if still live) get a fresh client from the
+  // currently installed plugin, which is what we want.
+  const stale = staleClientPids()
+  for (const { pid: sp, version } of stale) {
+    try { process.kill(sp, 'SIGTERM'); console.log(C.dim(`  stopped stale ${version} channel client pid=${sp}`)) } catch {}
+  }
+  if (stale.length > 0) await sleep(500)
+
   let pid = 0
   try { pid = parseInt(readFileSync(PID_FILE, 'utf8'), 10) } catch { /* no pid file */ }
   if (Number.isInteger(pid) && pid > 1) {
@@ -449,6 +496,14 @@ async function cmdDoctor(): Promise<number> {
   if (!h.up) checks.push({ label: 'gateway', level: 'warn', detail: `nothing serving :${PORT} — it spawns with the first agent client`, fix: 'clawvibe agents up' })
   else if (version && h.version !== version) checks.push({ label: 'gateway', level: 'fail', detail: `serving ${h.version} but ${version} is installed — a stale daemon owns :${PORT}`, fix: 'clawvibe agents restart' })
   else checks.push({ label: 'gateway', level: 'ok', detail: `${h.version} on :${PORT}` })
+
+  // Stale clients are the reason an upgrade silently doesn't take: they respawn the old
+  // daemon. Worth naming explicitly rather than leaving it as a mysterious version skew.
+  const stale = staleClientPids()
+  if (stale.length > 0) {
+    const byVer = [...new Set(stale.map(s => s.version))].join(', ')
+    checks.push({ label: 'stale clients', level: 'warn', detail: `${stale.length} channel client(s) from ${byVer} still running — these respawn the old daemon`, fix: 'clawvibe agents restart' })
+  }
 
   checks.push(await tailscaleState())
 
