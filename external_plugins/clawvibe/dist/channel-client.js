@@ -14222,7 +14222,7 @@ var AGENT_ID = EXPLICIT_AGENT || "default";
 var CONN_ID = `${AGENT_ID}#${randomUUID()}`;
 var DAEMON_PATH = ["gateway-daemon.js", "gateway-daemon.ts"].map((f) => join2(import.meta.dir, f)).find(existsSync) ?? join2(import.meta.dir, "gateway-daemon.ts");
 ensureStateDirs();
-var mcp = new Server({ name: "clawvibe", version: "0.1.4" }, {
+var mcp = new Server({ name: "clawvibe", version: "0.1.5" }, {
   capabilities: {
     tools: {},
     experimental: { "claude/channel": {}, "claude/channel/permission": {} }

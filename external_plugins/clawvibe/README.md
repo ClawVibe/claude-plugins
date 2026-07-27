@@ -15,14 +15,31 @@ The iOS app picks an agent and encodes it in the routing key `sessionKey = "agen
 
 ```
 /plugin install clawvibe@clawvibe-plugins      # in Claude Code
-clawvibe setup                                  # bundle check, CLI link, Tailscale check, start agents
-clawvibe agent add <id> --emoji 🤖              # define + configure an agent (repeat per agent)
-clawvibe agents up                              # start them (idempotent)
-clawvibe qr                                      # pair your iOS device
-clawvibe install-service                         # (optional) persist across reboot
 ```
 
-Requires [Bun](https://bun.sh) as the runtime. **Dependencies are bundled** — the committed `dist/` is self-contained (the MCP SDK is inlined), so no `bun install` is needed at runtime. `clawvibe setup` symlinks the CLI to `~/.local/bin/clawvibe` (ensure that's on your `PATH`) and reports whether the Tailscale ingress is correctly configured (see Deployment).
+**Then bootstrap the CLI by absolute path — this first call cannot be `clawvibe setup`.**
+Installing only unpacks the plugin into a version-keyed cache; nothing puts `clawvibe` on
+your `PATH` until `setup` creates the symlink, so the first invocation has to name the
+cache directly:
+
+```
+"$(ls -d ~/.claude/plugins/cache/clawvibe-plugins/clawvibe/*/ | sort -V | tail -1)bin/clawvibe" setup
+```
+
+(Inside a Claude Code session, `$CLAUDE_PLUGIN_ROOT/bin/clawvibe setup` is equivalent.)
+After that `clawvibe` resolves normally:
+
+```
+clawvibe agent add <id> --name "Name" --emoji 🤖   # define + configure an agent (repeat per agent)
+clawvibe agents up                                  # start them (idempotent)
+clawvibe qr                                         # pair your iOS device
+clawvibe doctor                                     # verify everything, or diagnose what isn't
+clawvibe install-service                            # (optional) persist across reboot
+```
+
+Requires [Bun](https://bun.sh) as the runtime, and `python3` for `clawvibe qr`. **Dependencies are bundled** — the committed `dist/` is self-contained (the MCP SDK is inlined), so no `bun install` is needed at runtime. `setup` symlinks the CLI to `~/.local/bin/clawvibe` and **warns if that directory is not on your `PATH`** (common in zsh); it also reports whether the Tailscale ingress is correctly configured (see Deployment).
+
+**If anything is wrong, run `clawvibe doctor`** — it checks the bundle, the CLI symlink and `PATH`, `bun`/`python3`, the gateway version actually being served (catching a stale daemon after an upgrade), the Tailscale ingress form, and each agent's running/registered/pinned state, printing a `fix:` for anything broken. The `setup` skill wraps the same decision tree for agents.
 
 ## Managing agents
 

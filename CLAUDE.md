@@ -15,6 +15,7 @@ This repo is a **Claude Code plugin marketplace** (not just a plugin). Structure
 ```
 clawvibe-plugin/                    # marketplace repo root
 ├── external_plugins/clawvibe/      # the actual plugin
+│   ├── skills/{connect,access,setup}/  # pair a device; manage access; install/troubleshoot
 │   ├── gateway-daemon.ts           # shared HTTP/WS gateway daemon (Bun): owns :8791, pairing, agent registry, IPC server
 │   ├── channel-client.ts           # per-session MCP server (`start`): connects to daemon over IPC, registers its agent
 │   ├── cli.ts                      # automation CLI: setup / agent add|rm|list / agents up|down / install-service
@@ -175,6 +176,8 @@ clawcode restart spongebob
 clawvibe setup [--apply-tailscale]   # bundle check, link ~/.local/bin/clawvibe, Tailscale check, agents up
 clawvibe agent add <id> --name "Friendly" --emoji 🤖   # writes ~/.claude/agents/<id>.md (+ managed-agents.json)
 clawvibe agents up | down | restart  # start (idempotent) / stop all clawvibe-* sessions / full recycle
+clawvibe doctor                      # one-shot diagnostic: PATH, bun, gateway version, ingress, agents
+clawvibe tailscale-check             # ingress form only
 clawvibe agent list                  # configured + running/registered status
 clawvibe install-service             # systemd --user unit running `agents up` at login/boot
 ```
