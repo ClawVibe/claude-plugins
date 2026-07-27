@@ -20,10 +20,18 @@ usage: clawvibe <command>
   agents up                      Start every configured agent (idempotent).
   agents down                    Stop all clawvibe-* agent sessions.
   agents restart                 down + stop the gateway daemon + up (use after upgrading).
+  doctor                         Diagnose install, PATH, ingress, gateway and agent problems.
+  tailscale-check                Check the :8791 ingress is a TLS-terminated TCP forward.
   install-service                systemd --user unit that runs 'agents up' at login/boot.
   qr [--text] [--no-wait]        Generate a pairing QR code.
   help                           This message.
 EOF
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  echo "clawvibe: '$1' is required but not on PATH — $2" >&2
+  return 1
 }
 
 cmd="${1:-help}"
@@ -31,12 +39,15 @@ shift || true
 
 case "$cmd" in
   qr)
+    need bun "install it from https://bun.sh" || exit 127
+    need python3 "install python3 (the QR renderer needs it)" || exit 127
     # Warn (non-blocking) if the Tailscale ingress can't carry WebSockets — the
     # most common cause of "paired but won't connect".
     bun "$PLUGIN_DIR/cli.ts" tailscale-check || true
     exec python3 "$PLUGIN_DIR/qr.py" "$@"
     ;;
-  setup|install-service|agent|agents)
+  setup|install-service|agent|agents|doctor|tailscale-check)
+    need bun "install it from https://bun.sh" || exit 127
     exec bun "$PLUGIN_DIR/cli.ts" "$cmd" "$@"
     ;;
   help|-h|--help)

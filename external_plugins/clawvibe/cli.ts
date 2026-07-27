@@ -9,6 +9,7 @@
  *   clawvibe agents up                   idempotently start every configured agent
  *   clawvibe agents restart              down + stop the gateway daemon + up (use after a plugin upgrade)
  *   clawvibe agents down                 stop all clawvibe-* sessions
+ *   clawvibe doctor                      diagnose install/ingress/agent problems
  *   clawvibe install-service             systemd --user unit that runs `agents up` at login/boot
  *
  * Managed-agent config: $CLAWVIBE_STATE_DIR/managed-agents.json = [{ id, model? }]
@@ -16,7 +17,7 @@
  * agent reports its own name/emoji on every `reply` (see channel-client instructions).
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync, unlinkSync, lstatSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync, unlinkSync, lstatSync, readdirSync, realpathSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import { STATE_DIR, PORT, PID_FILE, SOCK_FILE } from './shared/access.ts'
@@ -375,6 +376,123 @@ async function cmdAgentsRestart(): Promise<number> {
   return rc
 }
 
+// ── doctor ────────────────────────────────────────────────────────────────────
+
+type Check = { label: string; level: 'ok' | 'warn' | 'fail' | 'info'; detail: string; fix?: string }
+
+/** Newest installed plugin version dir, for spotting a stale CLI symlink. */
+function newestInstalledDir(): string | undefined {
+  const base = join(homedir(), '.claude', 'plugins', 'cache', 'clawvibe-plugins', 'clawvibe')
+  try {
+    const dirs = readdirSync(base).filter(d => /^\d+\.\d+\.\d+$/.test(d))
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+    return dirs.length ? join(base, dirs[dirs.length - 1]) : undefined
+  } catch { return undefined }
+}
+
+async function tailscaleState(): Promise<Check> {
+  const { code, out } = await sh(['tailscale', 'serve', 'status', '--json'])
+  if (code !== 0) return { label: 'tailscale ingress', level: 'info', detail: 'tailscale unavailable — fine for localhost-only use' }
+  let tcp: any = {}, web: Record<string, unknown> = {}
+  try { const j = JSON.parse(out); tcp = (j.TCP ?? {})[String(PORT)] ?? {}; web = j.Web ?? {} } catch {}
+  if (tcp.TCPForward && tcp.TerminateTLS) {
+    return { label: 'tailscale ingress', level: 'ok', detail: `TLS-terminated TCP :${PORT} → ${tcp.TCPForward}` }
+  }
+  const hasWeb = Object.keys(web).some(k => k.includes(`:${PORT}`))
+  return {
+    label: 'tailscale ingress',
+    level: 'fail',
+    detail: hasWeb
+      ? `:${PORT} is an --https WEB PROXY (HTTP/2) — WebSockets will connect then drop with code 1006`
+      : `:${PORT} has no TLS-terminated TCP forward — the app cannot reach this gateway over the tailnet`,
+    fix: `sudo tailscale serve --https=${PORT} off && sudo tailscale serve --bg --tls-terminated-tcp=${PORT} tcp://localhost:${PORT}`,
+  }
+}
+
+/**
+ * One-shot diagnostic. Exists because every failure this plugin has produced in the
+ * field is silent: no CLI on PATH, a stale daemon serving an old bundle, an --https
+ * Tailscale proxy that pairs fine then drops, an agent that is running but UNPINNED,
+ * or one that reported itself done and got reaped. Each is invisible individually and
+ * obvious in a list, so print the list.
+ */
+async function cmdDoctor(): Promise<number> {
+  const checks: Check[] = []
+  const version = pluginVersion()
+
+  checks.push({ label: 'plugin', level: 'info', detail: `${version ?? '?'} at ${PLUGIN_DIR}` })
+  const bundleOk = existsSync(join(PLUGIN_DIR, 'dist', 'channel-client.js')) && existsSync(join(PLUGIN_DIR, 'dist', 'gateway-daemon.js'))
+  checks.push({ label: 'bundle', level: bundleOk ? 'ok' : 'fail', detail: bundleOk ? 'dist/ present' : 'dist/ missing', fix: bundleOk ? undefined : 'bun run build' })
+
+  // CLI reachability — the fresh-install trap: install puts files in a version-keyed
+  // cache but nothing ever puts `clawvibe` on PATH.
+  const newest = newestInstalledDir()
+  let linkTarget: string | undefined
+  try { linkTarget = realpathSync(LOCAL_BIN) } catch {}
+  if (!linkTarget) {
+    checks.push({ label: 'clawvibe on PATH', level: 'fail', detail: `${LOCAL_BIN} does not exist`, fix: `${newest ? join(newest, 'bin', 'clawvibe') : '<cache>/bin/clawvibe'} setup` })
+  } else if (newest && !linkTarget.startsWith(newest)) {
+    checks.push({ label: 'clawvibe on PATH', level: 'warn', detail: `symlink points at ${linkTarget.replace(homedir(), '~')}, but ${newest.split('/').pop()} is installed`, fix: `ln -sfn ${join(newest, 'bin', 'clawvibe')} ${LOCAL_BIN}` })
+  } else {
+    checks.push({ label: 'clawvibe on PATH', level: 'ok', detail: linkTarget.replace(homedir(), '~') })
+  }
+  const onPath = (process.env.PATH ?? '').split(':').includes(join(homedir(), '.local', 'bin'))
+  checks.push({ label: '~/.local/bin in PATH', level: onPath ? 'ok' : 'warn', detail: onPath ? 'yes' : 'no — the symlink exists but your shell cannot find it', fix: onPath ? undefined : `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc` })
+
+  for (const [bin, why] of [['bun', 'required — the CLI and gateway run on it'], ['python3', 'required for `clawvibe qr`']] as const) {
+    const { code, out } = await sh(['sh', '-lc', `command -v ${bin}`])
+    checks.push({ label: bin, level: code === 0 ? 'ok' : 'fail', detail: code === 0 ? out.trim() : `not found — ${why}`, fix: code === 0 ? undefined : (bin === 'bun' ? 'curl -fsSL https://bun.sh/install | bash' : 'install python3') })
+  }
+
+  // Gateway: is it up, and is it the version we think we installed?
+  const h = await daemonHealth()
+  if (!h.up) checks.push({ label: 'gateway', level: 'warn', detail: `nothing serving :${PORT} — it spawns with the first agent client`, fix: 'clawvibe agents up' })
+  else if (version && h.version !== version) checks.push({ label: 'gateway', level: 'fail', detail: `serving ${h.version} but ${version} is installed — a stale daemon owns :${PORT}`, fix: 'clawvibe agents restart' })
+  else checks.push({ label: 'gateway', level: 'ok', detail: `${h.version} on :${PORT}` })
+
+  checks.push(await tailscaleState())
+
+  // Agents: configured / running / registered / pinned / settled.
+  const cfg = readConfig()
+  if (cfg.length === 0) {
+    checks.push({ label: 'agents', level: 'warn', detail: 'none configured', fix: 'clawvibe agent add <id> --name "Name" --emoji 🤖' })
+  } else {
+    const running = await runningByName()
+    const pins = new Set(await readPins())
+    let registered = new Set<string>()
+    try { registered = new Set(((await (await fetch(`http://127.0.0.1:${PORT}/agents`, { signal: AbortSignal.timeout(2000) })).json()) as any[]).map(a => a.id)) } catch {}
+    for (const a of cfg) {
+      const s = running[`clawvibe-${a.id}`]
+      if (!s) { checks.push({ label: `agent ${a.id}`, level: 'warn', detail: 'not running', fix: 'clawvibe agents up' }); continue }
+      const pinned = pins.has(s.id)
+      const reg = registered.has(a.id)
+      const bits = [`running (${s.id})`, reg ? 'registered' : 'NOT registered', pinned ? 'pinned' : 'UNPINNED']
+      checks.push({
+        label: `agent ${a.id}`,
+        level: pinned && reg ? 'ok' : (pinned ? 'warn' : 'fail'),
+        detail: bits.join(', ') + (pinned ? '' : ' — will be reaped once it settles'),
+        fix: pinned ? (reg ? undefined : 'agent has not answered its liveness probe yet; give it a few seconds, or check it is a --channels session') : 'clawvibe agents restart',
+      })
+    }
+  }
+
+  let devices = 0
+  try { devices = Object.keys((JSON.parse(readFileSync(join(STATE_DIR, 'access.json'), 'utf8')) as any).approved ?? {}).length } catch {}
+  checks.push({ label: 'paired devices', level: devices > 0 ? 'ok' : 'info', detail: String(devices), fix: devices ? undefined : 'clawvibe qr' })
+  checks.push({ label: 'state dir', level: 'info', detail: STATE_DIR })
+
+  const mark = { ok: C.ok('✓'), warn: C.warn('!'), fail: C.err('✗'), info: C.dim('·') }
+  console.log('clawvibe doctor:')
+  for (const c of checks) {
+    console.log(`  ${mark[c.level]} ${c.label.padEnd(22)} ${c.detail}`)
+    if (c.fix) console.log(C.dim(`      fix: ${c.fix}`))
+  }
+  const fails = checks.filter(c => c.level === 'fail').length
+  const warns = checks.filter(c => c.level === 'warn').length
+  console.log(fails ? C.err(`\n${fails} problem(s), ${warns} warning(s)`) : warns ? C.warn(`\n${warns} warning(s)`) : C.ok('\nall good'))
+  return fails > 0 ? 1 : 0
+}
+
 // ── setup ─────────────────────────────────────────────────────────────────────
 
 function linkCli(): void {
@@ -408,7 +526,16 @@ async function cmdSetup(args: string[]): Promise<number> {
   }
   console.log(C.ok('  bundle present ✓'))
   // 2. stable CLI symlink
-  linkCli(); console.log(C.ok(`  linked ${LOCAL_BIN} ✓`) + C.dim('  (ensure ~/.local/bin is on PATH)'))
+  linkCli()
+  const localBin = join(homedir(), '.local', 'bin')
+  if ((process.env.PATH ?? '').split(':').includes(localBin)) {
+    console.log(C.ok(`  linked ${LOCAL_BIN} ✓`))
+  } else {
+    // Silently creating a symlink the shell can't find is how "command not found"
+    // survives a successful-looking setup.
+    console.log(C.warn(`  linked ${LOCAL_BIN} — but ~/.local/bin is NOT on your PATH`))
+    console.log(C.dim(`    add: echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc`))
+  }
   // 3. tailscale ingress
   await checkTailscale(flags['apply-tailscale'] === true)
   // 4. agents
@@ -460,6 +587,7 @@ async function main(): Promise<number> {
   const [verb, sub, ...rest] = process.argv.slice(2)
   switch (verb) {
     case 'setup': return cmdSetup([sub, ...rest].filter(Boolean))
+    case 'doctor': return cmdDoctor()
     case 'tailscale-check': { console.log('ClawVibe ingress check:'); await checkTailscale(false); return 0 }
     case 'install-service': return cmdInstallService()
     case 'agents':
