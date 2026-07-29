@@ -195,6 +195,93 @@ function makeLineDecoder(onFrame) {
   };
 }
 
+// shared/listing.ts
+var UNREACHABLE_SUFFIX = " (no channel)";
+function mergeAgentList(confirmed, pinnedLive) {
+  const rows = confirmed.map((c) => ({
+    id: c.agentId,
+    name: c.name,
+    emoji: c.emoji,
+    reachable: true
+  }));
+  const claimed = new Set(confirmed.map((c) => c.jobId).filter((j) => !!j));
+  for (const s of pinnedLive) {
+    if (claimed.has(s.id))
+      continue;
+    claimed.add(s.id);
+    rows.push({
+      id: s.id,
+      name: (s.name?.trim() || s.id) + UNREACHABLE_SUFFIX,
+      emoji: null,
+      reachable: false
+    });
+  }
+  return rows;
+}
+function defaultAgentId(rows) {
+  return (rows.find((r) => r.reachable) ?? rows[0])?.id ?? "default";
+}
+
+// shared/pins.ts
+import { mkdir, stat, rm, readFile, writeFile, rename } from "fs/promises";
+import { homedir as homedir2 } from "os";
+import { join as join2 } from "path";
+var CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? join2(homedir2(), ".claude");
+var PINS_FILE = join2(CONFIG_DIR, "jobs", "pins.json");
+var LOCK_PATH = `${PINS_FILE}.lock`;
+async function readPins() {
+  try {
+    const parsed = JSON.parse(await readFile(PINS_FILE, "utf8"));
+    if (!Array.isArray(parsed))
+      return [];
+    return parsed.filter((x) => typeof x === "string");
+  } catch {
+    return [];
+  }
+}
+
+// shared/sessions.ts
+var ROSTER_TIMEOUT_MS = 5000;
+var warnedFailure = false;
+async function liveSessions() {
+  try {
+    const p = Bun.spawn({
+      cmd: ["claude", "agents", "--json", "--all"],
+      stdout: "pipe",
+      stderr: "ignore"
+    });
+    const timer = setTimeout(() => {
+      try {
+        p.kill();
+      } catch {}
+    }, ROSTER_TIMEOUT_MS);
+    const out = await new Response(p.stdout).text();
+    const code = await p.exited;
+    clearTimeout(timer);
+    if (code !== 0)
+      throw new Error(`claude agents exited ${code}`);
+    const parsed = JSON.parse(out);
+    if (!Array.isArray(parsed))
+      return [];
+    warnedFailure = false;
+    return parsed.filter((s) => !!s && typeof s.id === "string").map((s) => ({ id: s.id, name: s.name ?? null }));
+  } catch (err) {
+    if (!warnedFailure) {
+      warnedFailure = true;
+      process.stderr.write(`clawvibe-daemon: session roster unavailable (${err}) \u2014 listing confirmed agents only
+`);
+    }
+    return [];
+  }
+}
+async function pinnedLiveSessions() {
+  const [pins, sessions] = await Promise.all([readPins(), liveSessions()]);
+  if (pins.length === 0)
+    return [];
+  const pinned = new Set(pins);
+  return sessions.filter((s) => pinned.has(s.id));
+}
+
 // gateway-daemon.ts
 var startedAt = Date.now();
 ensureStateDirs();
@@ -251,6 +338,17 @@ function connForAgent(agentId) {
   }
   return best;
 }
+function connForJob(jobId) {
+  let best;
+  for (const c of agentClients.values()) {
+    if (c.jobId !== jobId)
+      continue;
+    if (!best || c.confirmed && !best.confirmed || c.confirmed === best.confirmed && c.registeredAt > best.registeredAt) {
+      best = c;
+    }
+  }
+  return best;
+}
 function confirmedAgents() {
   const byAgent = new Map;
   for (const c of agentClients.values()) {
@@ -296,13 +394,14 @@ function probeAgent(conn) {
 function handleIpcFrame(sock, frame) {
   switch (frame.t) {
     case "register": {
-      const { agentId, connId } = frame;
+      const { agentId, connId, jobId } = frame;
       const prev = agentClients.get(connId);
       sock.data.agentId = agentId;
       sock.data.connId = connId;
       const conn = {
         connId,
         agentId,
+        jobId: jobId ?? prev?.jobId,
         sock,
         registeredAt: Date.now(),
         confirmed: prev?.confirmed ?? false,
@@ -506,11 +605,13 @@ function broadcastChatEvent(runId, sessionKey, state, opts = {}) {
 setInterval(() => {
   reapDeadSockets();
   pruneActiveRuns();
+  refreshPinnedSnapshot();
   broadcastEvent({ type: "event", event: "tick", payload: null, seq: nextEventSeq(), stateVersion: null });
 }, TICK_INTERVAL_MS);
 function routeInbound(sessionKey, runId, text, meta) {
   const agentId = agentIdFromSessionKey(sessionKey) ?? pickFallbackAgentId();
-  const conn = agentId ? connForAgent(agentId) : undefined;
+  const byJob = agentId ? connForJob(agentId) : undefined;
+  const conn = (agentId ? connForAgent(agentId) : undefined) ?? (byJob?.confirmed ? byJob : undefined);
   if (!conn) {
     process.stderr.write(`clawvibe-daemon: no agent for session=${sessionKey} (agentId=${agentId})
 `);
@@ -630,7 +731,7 @@ function handleConnect(ws, req) {
     payload: {
       type: "hello_ok",
       protocol: 3,
-      server: { name: "clawvibe", version: "0.1.6" },
+      server: { name: "clawvibe", version: "0.1.7" },
       features: {},
       snapshot: {
         presence: [],
@@ -717,10 +818,40 @@ function reprobeUnconfirmed() {
       probeAgent(c);
   }
 }
+var pinnedSnapshot = [];
+var lastPinnedRefresh = 0;
+var pinnedRefreshInFlight = false;
+var PINNED_KICK_MS = 5000;
+function refreshPinnedSnapshot() {
+  if (pinnedRefreshInFlight)
+    return;
+  pinnedRefreshInFlight = true;
+  lastPinnedRefresh = Date.now();
+  pinnedLiveSessions().then((s) => {
+    pinnedSnapshot = s;
+  }).catch((err) => process.stderr.write(`clawvibe-daemon: pinned refresh failed: ${err}
+`)).finally(() => {
+    pinnedRefreshInFlight = false;
+  });
+}
+function kickPinnedRefresh() {
+  if (Date.now() - lastPinnedRefresh > PINNED_KICK_MS)
+    refreshPinnedSnapshot();
+}
+function listedAgents() {
+  const confirmed = confirmedAgents().map((c) => ({
+    agentId: c.agentId,
+    jobId: c.jobId,
+    name: c.identity?.name ?? c.agentId,
+    emoji: c.identity?.emoji ?? null
+  }));
+  return mergeAgentList(confirmed, pinnedSnapshot);
+}
 function handleAgentsList(ws, req) {
   reprobeUnconfirmed();
-  const agents = confirmedAgents();
-  const defaultId = agents.length > 0 ? agents[0].agentId : "default";
+  kickPinnedRefresh();
+  const agents = listedAgents();
+  const defaultId = defaultAgentId(agents);
   sendFrame(ws, {
     type: "res",
     id: req.id,
@@ -729,12 +860,13 @@ function handleAgentsList(ws, req) {
       defaultId,
       mainKey: `agent:${defaultId}`,
       scope: "all",
-      agents: agents.map((c) => ({
-        id: c.agentId,
-        name: c.identity?.name ?? c.agentId,
-        identity: { name: c.identity?.name ?? c.agentId, emoji: c.identity?.emoji ?? null },
+      agents: agents.map((a) => ({
+        id: a.id,
+        name: a.name,
+        identity: { name: a.name, emoji: a.emoji },
         workspace: null,
-        model: null
+        model: null,
+        reachable: a.reachable
       }))
     }
   });
@@ -744,6 +876,17 @@ function handleAgentIdentityGet(ws, req) {
   const agentId = params.agentId ?? "default";
   const c = connForAgent(agentId);
   if (!c || !c.confirmed) {
+    const pinned = pinnedSnapshot.find((s) => s.id === agentId);
+    if (pinned) {
+      const row = listedAgents().find((a) => a.id === agentId);
+      sendFrame(ws, {
+        type: "res",
+        id: req.id,
+        ok: true,
+        payload: { agentId, name: row?.name ?? pinned.name ?? agentId, avatar: null, emoji: null }
+      });
+      return;
+    }
     sendFrame(ws, { type: "res", id: req.id, ok: false, error: { message: `agent not found: ${agentId}` } });
     return;
   }
@@ -820,16 +963,12 @@ function startHttpServer() {
     fetch(req, server) {
       const url = new URL(req.url);
       if ((url.pathname === "/" || url.pathname === "/health") && !req.headers.get("upgrade")) {
-        return Response.json({ ok: true, server: "clawvibe", version: "0.1.6" });
+        return Response.json({ ok: true, server: "clawvibe", version: "0.1.7" });
       }
       if (url.pathname === "/agents" && req.method === "GET") {
         reprobeUnconfirmed();
-        const agents = confirmedAgents().map((c) => ({
-          id: c.agentId,
-          name: c.identity?.name ?? c.agentId,
-          emoji: c.identity?.emoji ?? null
-        }));
-        return Response.json(agents);
+        kickPinnedRefresh();
+        return Response.json(listedAgents());
       }
       if (url.pathname === "/bootstrap-token" && req.method === "POST") {
         const { token, expiresAt } = newBootstrapToken();
@@ -1011,6 +1150,7 @@ try {
 writeFileSync2(PID_FILE, String(process.pid));
 process.stderr.write(`clawvibe-daemon: listening on http://${HOSTNAME}:${PORT} (ipc ${SOCK_FILE})
 `);
+refreshPinnedSnapshot();
 var shuttingDown = false;
 function shutdown(sig) {
   if (shuttingDown)

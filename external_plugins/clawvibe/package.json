@@ -1,6 +1,6 @@
 {
   "name": "clawvibe-channel",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,9 +8,13 @@
     "start": "bun dist/channel-client.js",
     "daemon": "bun dist/gateway-daemon.js",
     "test:storm": "bun test/storm-regression.ts",
-    "test:pins": "bun test/pins.test.ts"
+    "test:pins": "bun test/pins.test.ts",
+    "test:listing": "bun test/listing.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14"
   }
 }

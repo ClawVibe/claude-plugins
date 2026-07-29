@@ -85,7 +85,12 @@ if (pkA.length > 0) {
   send(clients[0], { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'reply', arguments: { conversation_id: pkA[0], text: 'pong', name: 'Verified Agent', emoji: '🧪' } } })
 }
 await sleep(1200)
-const agentsAfter = await (await fetch(`http://127.0.0.1:${PORT}/agents`)).json() as any[]
+// `/agents` also carries pinned-but-unreachable sessions from the REAL machine's
+// pin registry (~/.claude/jobs/pins.json is the runtime's file and is deliberately
+// not redirected by CLAWVIBE_STATE_DIR). This regression is about confirmed clients,
+// so scope the assertions to reachable rows.
+const agentsAll = await (await fetch(`http://127.0.0.1:${PORT}/agents`)).json() as any[]
+const agentsAfter = agentsAll.filter(a => a.reachable !== false)
 
 // ── assertions ──────────────────────────────────────────────────────────────
 const registers = (dErr.match(/agent registered/g) ?? []).length

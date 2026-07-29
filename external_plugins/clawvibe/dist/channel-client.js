@@ -14220,9 +14220,10 @@ function makeLineDecoder(onFrame) {
 var EXPLICIT_AGENT = process.env.CLAUDE_CODE_AGENT || process.env.CLAWVIBE_AGENT_ID || "";
 var AGENT_ID = EXPLICIT_AGENT || "default";
 var CONN_ID = `${AGENT_ID}#${randomUUID()}`;
+var JOB_ID = (process.env.CLAUDE_JOB_DIR ?? "").split("/").filter(Boolean).pop();
 var DAEMON_PATH = ["gateway-daemon.js", "gateway-daemon.ts"].map((f) => join2(import.meta.dir, f)).find(existsSync) ?? join2(import.meta.dir, "gateway-daemon.ts");
 ensureStateDirs();
-var mcp = new Server({ name: "clawvibe", version: "0.1.6" }, {
+var mcp = new Server({ name: "clawvibe", version: "0.1.7" }, {
   capabilities: {
     tools: {},
     experimental: { "claude/channel": {}, "claude/channel/permission": {} }
@@ -14431,7 +14432,7 @@ async function connectDaemon() {
             }
           }
         });
-        sendIpc({ v: 1, t: "register", agentId: AGENT_ID, connId: CONN_ID, pid: process.pid });
+        sendIpc({ v: 1, t: "register", agentId: AGENT_ID, connId: CONN_ID, pid: process.pid, jobId: JOB_ID });
         process.stderr.write(`clawvibe-client: connected + registered agent=${AGENT_ID} conn=${CONN_ID} (awaiting probe confirmation)
 `);
         backoffMs = RECONNECT_BASE_MS;

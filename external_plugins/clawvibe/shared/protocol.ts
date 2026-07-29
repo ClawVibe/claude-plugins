@@ -79,6 +79,10 @@ export type IpcRegister = {
   agentId: string
   connId: string
   pid: number
+  /** Short (8-hex) background-session id, from `$CLAUDE_JOB_DIR`'s basename. This is
+   *  the key the runtime's pin registry uses, so it is the ONLY link between a live
+   *  client and a pinned session. Absent for foreground sessions (no job dir). */
+  jobId?: string
 }
 
 /** daemon → client: registration accepted. */

@@ -32,6 +32,11 @@ import {
   type RequestFrame, type ResponseFrame, type EventFrame, type WSData,
   type ChatState, type InboundMeta, type AgentIdentity, type IpcFrame,
 } from './shared/protocol.ts'
+import {
+  mergeAgentList, defaultAgentId,
+  type ConfirmedAgent, type LiveSession, type ListedAgent,
+} from './shared/listing.ts'
+import { pinnedLiveSessions } from './shared/sessions.ts'
 
 const startedAt = Date.now()
 
@@ -85,6 +90,9 @@ type SockState = { decode: (chunk: Uint8Array) => void; agentId?: string; connId
 type AgentConn = {
   connId: string
   agentId: string
+  /** Short bg-session id (pins.json key), when the client runs in a background
+   *  session. Links this connection to a pinned session so the two are listed once. */
+  jobId?: string
   identity?: AgentIdentity
   sock: Socket<SockState>
   registeredAt: number
@@ -104,6 +112,19 @@ function connForAgent(agentId: string): AgentConn | undefined {
   let best: AgentConn | undefined
   for (const c of agentClients.values()) {
     if (c.agentId !== agentId) continue
+    if (!best || (c.confirmed && !best.confirmed) || (c.confirmed === best.confirmed && c.registeredAt > best.registeredAt)) {
+      best = c
+    }
+  }
+  return best
+}
+
+/** Live connection for a background-session (pin) id. Used to route to pin-keyed
+ *  agents, whose agentId is the useless catch-all "claude". */
+function connForJob(jobId: string): AgentConn | undefined {
+  let best: AgentConn | undefined
+  for (const c of agentClients.values()) {
+    if (c.jobId !== jobId) continue
     if (!best || (c.confirmed && !best.confirmed) || (c.confirmed === best.confirmed && c.registeredAt > best.registeredAt)) {
       best = c
     }
@@ -153,7 +174,7 @@ function probeAgent(conn: AgentConn): void {
 function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
   switch (frame.t) {
     case 'register': {
-      const { agentId, connId } = frame
+      const { agentId, connId, jobId } = frame
       // NO eviction: a duplicate agentId is a legitimate second session, not a stale
       // client. Ending the incumbent here (and its instant reconnect) was the storm.
       // Re-registration of the SAME connId is the same process reconnecting, so carry
@@ -164,6 +185,7 @@ function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
       const conn: AgentConn = {
         connId,
         agentId,
+        jobId: jobId ?? prev?.jobId,
         sock,
         registeredAt: Date.now(),
         confirmed: prev?.confirmed ?? false,
@@ -349,6 +371,7 @@ function broadcastChatEvent(
 setInterval(() => {
   reapDeadSockets()
   pruneActiveRuns()
+  refreshPinnedSnapshot()
   broadcastEvent({ type: 'event', event: 'tick', payload: null, seq: nextEventSeq(), stateVersion: null })
 }, TICK_INTERVAL_MS)
 
@@ -356,7 +379,15 @@ setInterval(() => {
 
 function routeInbound(sessionKey: string, runId: string, text: string, meta: InboundMeta): boolean {
   const agentId = agentIdFromSessionKey(sessionKey) ?? pickFallbackAgentId()
-  const conn = agentId ? connForAgent(agentId) : undefined
+  // agentId first, job id second: a device paired before pin-keyed listing still
+  // holds `agent:spongebob:…` session keys, and those must keep routing.
+  //
+  // The job-id path requires CONFIRMED, unlike the agentId path. A pinned session
+  // usually has no --channels, and its client (the plugin merely being enabled) will
+  // accept the IPC frame and then do nothing with it — the app would spin until the
+  // 5-minute activeRuns TTL. Refusing here turns that into an immediate error.
+  const byJob = agentId ? connForJob(agentId) : undefined
+  const conn = (agentId ? connForAgent(agentId) : undefined) ?? (byJob?.confirmed ? byJob : undefined)
   if (!conn) {
     process.stderr.write(`clawvibe-daemon: no agent for session=${sessionKey} (agentId=${agentId})\n`)
     return false
@@ -472,7 +503,7 @@ function handleConnect(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
     payload: {
       type: 'hello_ok',
       protocol: 3,
-      server: { name: 'clawvibe', version: '0.1.6' },
+      server: { name: 'clawvibe', version: '0.1.7' },
       features: {},
       snapshot: {
         presence: [], health: { ok: true }, stateVersion: { presence: 0, health: 0 },
@@ -551,22 +582,64 @@ function reprobeUnconfirmed(): void {
   }
 }
 
+// ── Pinned-session snapshot ──────────────────────────────────────────────────
+//
+// Resolving pins.json ∩ `claude agents --json` costs a subprocess spawn, so it is
+// NEVER done in an RPC handler. The daemon keeps a snapshot, refreshed on the 30s
+// tick and kicked (throttled) whenever the app asks for the list; handlers stay
+// synchronous and serve whatever the last refresh produced. A stale-by-30s list is
+// the right trade against blocking the gateway on a child process.
+
+let pinnedSnapshot: LiveSession[] = []
+let lastPinnedRefresh = 0
+let pinnedRefreshInFlight = false
+const PINNED_KICK_MS = 5_000
+
+function refreshPinnedSnapshot(): void {
+  if (pinnedRefreshInFlight) return
+  pinnedRefreshInFlight = true
+  lastPinnedRefresh = Date.now()
+  void pinnedLiveSessions()
+    .then(s => { pinnedSnapshot = s })
+    .catch(err => process.stderr.write(`clawvibe-daemon: pinned refresh failed: ${err}\n`))
+    .finally(() => { pinnedRefreshInFlight = false })
+}
+
+function kickPinnedRefresh(): void {
+  if (Date.now() - lastPinnedRefresh > PINNED_KICK_MS) refreshPinnedSnapshot()
+}
+
+/** The app-facing agent list: confirmed clients + pinned live sessions. */
+function listedAgents(): ListedAgent[] {
+  const confirmed: ConfirmedAgent[] = confirmedAgents().map(c => ({
+    agentId: c.agentId,
+    jobId: c.jobId,
+    name: c.identity?.name ?? c.agentId,
+    emoji: c.identity?.emoji ?? null,
+  }))
+  return mergeAgentList(confirmed, pinnedSnapshot)
+}
+
 function handleAgentsList(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   reprobeUnconfirmed()
-  const agents = confirmedAgents()
-  const defaultId = agents.length > 0 ? agents[0].agentId : 'default'
+  kickPinnedRefresh()
+  const agents = listedAgents()
+  const defaultId = defaultAgentId(agents)
   sendFrame(ws, {
     type: 'res', id: req.id, ok: true,
     payload: {
       defaultId,
       mainKey: `agent:${defaultId}`,
       scope: 'all',
-      agents: agents.map(c => ({
-        id: c.agentId,
-        name: c.identity?.name ?? c.agentId,
-        identity: { name: c.identity?.name ?? c.agentId, emoji: c.identity?.emoji ?? null },
+      agents: agents.map(a => ({
+        id: a.id,
+        name: a.name,
+        identity: { name: a.name, emoji: a.emoji },
         workspace: null,
         model: null,
+        // Extra field: older app builds ignore it, newer ones can grey the row.
+        // The name suffix is what makes it visible either way.
+        reachable: a.reachable,
       })),
     },
   })
@@ -577,6 +650,18 @@ function handleAgentIdentityGet(ws: ServerWebSocket<WSData>, req: RequestFrame):
   const agentId = (params.agentId as string) ?? 'default'
   const c = connForAgent(agentId)
   if (!c || !c.confirmed) {
+    // Pin-keyed rows have no confirmed client by definition — answer from the
+    // snapshot so the app can still render the name it was just listed under,
+    // rather than erroring on an agent it can see in the picker.
+    const pinned = pinnedSnapshot.find(s => s.id === agentId)
+    if (pinned) {
+      const row = listedAgents().find(a => a.id === agentId)
+      sendFrame(ws, {
+        type: 'res', id: req.id, ok: true,
+        payload: { agentId, name: row?.name ?? pinned.name ?? agentId, avatar: null, emoji: null },
+      })
+      return
+    }
     sendFrame(ws, { type: 'res', id: req.id, ok: false, error: { message: `agent not found: ${agentId}` } })
     return
   }
@@ -656,16 +741,15 @@ function startHttpServer() {
       const url = new URL(req.url)
 
       if ((url.pathname === '/' || url.pathname === '/health') && !req.headers.get('upgrade')) {
-        return Response.json({ ok: true, server: 'clawvibe', version: '0.1.6' })
+        return Response.json({ ok: true, server: 'clawvibe', version: '0.1.7' })
       }
 
-      // Agent discovery (HTTP) — confirmed (probe-answered) agents only.
+      // Agent discovery (HTTP) — confirmed (probe-answered) agents plus pinned
+      // live sessions, which are listed but not reachable.
       if (url.pathname === '/agents' && req.method === 'GET') {
         reprobeUnconfirmed()
-        const agents = confirmedAgents().map(c => ({
-          id: c.agentId, name: c.identity?.name ?? c.agentId, emoji: c.identity?.emoji ?? null,
-        }))
-        return Response.json(agents)
+        kickPinnedRefresh()
+        return Response.json(listedAgents())
       }
 
       if (url.pathname === '/bootstrap-token' && req.method === 'POST') {
@@ -816,6 +900,10 @@ try {
 // (4) Claim the PID file now that we own both the socket and the port.
 writeFileSync(PID_FILE, String(process.pid))
 process.stderr.write(`clawvibe-daemon: listening on http://${HOSTNAME}:${PORT} (ipc ${SOCK_FILE})\n`)
+
+// Populate the pinned-session snapshot immediately, so the first agents.list after
+// a daemon start isn't answered from an empty one.
+refreshPinnedSnapshot()
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 

@@ -35,6 +35,11 @@ const AGENT_ID = EXPLICIT_AGENT || 'default'
 // AGENT_ID alone is the agent *type* and collides between concurrent sessions —
 // keying the daemon registry on it made two clients evict each other forever.
 const CONN_ID = `${AGENT_ID}#${randomUUID()}`
+// Background sessions run with $CLAUDE_JOB_DIR=~/.claude/jobs/<8-hex>, and that
+// <8-hex> is exactly the key in the runtime's pin registry. Reporting it is what
+// lets the daemon tell "this connected client IS that pinned session" apart from
+// "that pinned session has no client at all". Empty for foreground sessions.
+const JOB_ID = (process.env.CLAUDE_JOB_DIR ?? '').split('/').filter(Boolean).pop()
 // Resolve the daemon next to the running file — `.js` when bundled into dist/,
 // `.ts` when running from source.
 const DAEMON_PATH =
@@ -47,7 +52,7 @@ ensureStateDirs()
 // ── MCP server + tools ─────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: 'clawvibe', version: '0.1.6' },
+  { name: 'clawvibe', version: '0.1.7' },
   {
     capabilities: {
       tools: {},
@@ -267,7 +272,7 @@ async function connectDaemon(): Promise<void> {
           },
         })
         // Register this agent with the daemon.
-        sendIpc({ v: 1, t: 'register', agentId: AGENT_ID, connId: CONN_ID, pid: process.pid })
+        sendIpc({ v: 1, t: 'register', agentId: AGENT_ID, connId: CONN_ID, pid: process.pid, jobId: JOB_ID })
         process.stderr.write(`clawvibe-client: connected + registered agent=${AGENT_ID} conn=${CONN_ID} (awaiting probe confirmation)\n`)
         backoffMs = RECONNECT_BASE_MS
         return
