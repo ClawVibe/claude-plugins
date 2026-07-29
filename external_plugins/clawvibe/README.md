@@ -7,7 +7,7 @@ Works on any Claude Code instance — ClawCode users and generic users alike —
 ## Architecture
 
 - **Gateway daemon** (`gateway-daemon.ts`): one long-lived, detached singleton per machine. Owns the HTTP/WS port (`:8791`), device pairing/`access.json`, and a dynamic registry of connected agents. Auto-spawned by the first agent's channel client (via `setsid`) and lingers so pairing keeps working.
-- **Channel client** (`channel-client.ts`): the per-session MCP server loaded via `--channels`. Connects to the daemon over a Unix socket, registers its agent id (`CLAUDE_CODE_AGENT`), relays inbound messages, and sends replies. The daemon **probes** it to confirm it's a live `--channels` agent and learns its display name/emoji from the reply (every reply carries them) — so only confirmed agents are listed, and identity stays current without reading any file.
+- **Channel client** (`channel-client.ts`): the per-session MCP server loaded via `--channels`. Connects to the daemon over a Unix socket, registers its agent id (`CLAUDE_CODE_AGENT`), relays inbound messages, and sends replies. The daemon **probes** it to confirm it's a live `--channels` agent and learns its display name/emoji from the reply (every reply carries them) — so only confirmed agents are **reachable**, and identity stays current without reading any file. The list also includes pinned live sessions (`pins.json` ∩ `claude agents --json`), marked `reachable: false` — they have no `--channels` client, so they can be seen but not messaged.
 
 The iOS app picks an agent and encodes it in the routing key `sessionKey = "agent:<agentId>:clawvibe:app:<deviceId>"`; the daemon routes to that agent and returns its reply to only the originating device.
 
