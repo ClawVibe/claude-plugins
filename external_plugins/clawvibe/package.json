@@ -9,7 +9,8 @@
     "daemon": "bun dist/gateway-daemon.js",
     "test:storm": "bun test/storm-regression.ts",
     "test:pins": "bun test/pins.test.ts",
-    "test:listing": "bun test/listing.ts"
+    "test:listing": "bun test/listing.ts",
+    "test:reachability": "bun test/reachability.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

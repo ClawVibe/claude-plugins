@@ -197,14 +197,14 @@ function makeLineDecoder(onFrame) {
 
 // shared/listing.ts
 var UNREACHABLE_SUFFIX = " (no channel)";
-function mergeAgentList(confirmed, pinnedLive) {
-  const rows = confirmed.map((c) => ({
+function mergeAgentList(connected, pinnedLive) {
+  const rows = connected.map((c) => ({
     id: c.agentId,
     name: c.name,
     emoji: c.emoji,
     reachable: true
   }));
-  const claimed = new Set(confirmed.map((c) => c.jobId).filter((j) => !!j));
+  const claimed = new Set(connected.map((c) => c.jobId).filter((j) => !!j));
   for (const s of pinnedLive) {
     if (claimed.has(s.id))
       continue;
@@ -326,6 +326,7 @@ process.on("unhandledRejection", (err) => {
   process.stderr.write(`clawvibe-daemon: unhandled rejection: ${err}
 `);
 });
+var GENERIC_AGENT_ID = "claude";
 var agentClients = new Map;
 function connForAgent(agentId) {
   let best;
@@ -349,14 +350,17 @@ function connForJob(jobId) {
   }
   return best;
 }
-function confirmedAgents() {
+function reachableAgents() {
   const byAgent = new Map;
   for (const c of agentClients.values()) {
-    if (!c.confirmed)
+    if (!c.agentId)
+      continue;
+    if (c.agentId === GENERIC_AGENT_ID && !c.confirmed)
       continue;
     const prev = byAgent.get(c.agentId);
-    if (!prev || c.registeredAt > prev.registeredAt)
+    if (!prev || c.confirmed && !prev.confirmed || c.confirmed === prev.confirmed && c.registeredAt > prev.registeredAt) {
       byAgent.set(c.agentId, c);
+    }
   }
   return [...byAgent.values()];
 }
@@ -371,6 +375,9 @@ function writeIpc(sock, frame) {
 function pickFallbackAgentId() {
   for (const c of agentClients.values())
     if (c.confirmed)
+      return c.agentId;
+  for (const c of agentClients.values())
+    if (c.agentId && c.agentId !== GENERIC_AGENT_ID)
       return c.agentId;
   return null;
 }
@@ -611,7 +618,7 @@ setInterval(() => {
 function routeInbound(sessionKey, runId, text, meta) {
   const agentId = agentIdFromSessionKey(sessionKey) ?? pickFallbackAgentId();
   const byJob = agentId ? connForJob(agentId) : undefined;
-  const conn = (agentId ? connForAgent(agentId) : undefined) ?? (byJob?.confirmed ? byJob : undefined);
+  const conn = (agentId ? connForAgent(agentId) : undefined) ?? byJob;
   if (!conn) {
     process.stderr.write(`clawvibe-daemon: no agent for session=${sessionKey} (agentId=${agentId})
 `);
@@ -839,13 +846,13 @@ function kickPinnedRefresh() {
     refreshPinnedSnapshot();
 }
 function listedAgents() {
-  const confirmed = confirmedAgents().map((c) => ({
+  const reachable = reachableAgents().map((c) => ({
     agentId: c.agentId,
     jobId: c.jobId,
-    name: c.identity?.name ?? c.agentId,
+    name: c.identity?.name ?? (c.jobId ? pinnedSnapshot.find((s) => s.id === c.jobId)?.name?.trim() || undefined : undefined) ?? c.agentId,
     emoji: c.identity?.emoji ?? null
   }));
-  return mergeAgentList(confirmed, pinnedSnapshot);
+  return mergeAgentList(reachable, pinnedSnapshot);
 }
 function handleAgentsList(ws, req) {
   reprobeUnconfirmed();
