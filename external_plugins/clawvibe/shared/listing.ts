@@ -3,10 +3,15 @@
  *
  * Two sources, deliberately unequal:
  *
- *  1. CONFIRMED clients — an agent that answered the probe. These are the only
- *     agents that can actually receive a message, because delivery needs a live
- *     channel client, which only exists when the session was launched with
- *     `--channels`. Unchanged behaviour, and always reachable.
+ *  1. CONNECTED clients — an agent with a live channel client on the IPC socket.
+ *     These are the only agents that can actually receive a message, because delivery
+ *     needs a live channel client, which only exists when the session was launched
+ *     with `--channels`. Always reachable.
+ *
+ *     Answering the daemon's probe is NOT required (issue #25). It used to be, and the
+ *     probe costs an inference turn, so agents that missed the one fired at them during
+ *     session boot were listed here as absent and appeared below as "(no channel)" pin
+ *     rows despite being connected and perfectly able to receive.
  *
  *  2. PINNED LIVE SESSIONS — the runtime's pin registry (`~/.claude/jobs/pins.json`)
  *     intersected with the sessions `claude agents --json --all` actually reports.
@@ -20,7 +25,7 @@
  *     too (a `tmp/` dir with no state.json), and they are not background agents.
  * Only `claude agents --json` distinguishes a real live session from either.
  *
- * A pinned session with no confirmed client is listed but NOT reachable: it has no
+ * A pinned session with no connected client is listed but NOT reachable: it has no
  * `--channels`, so an inbound message can never become a turn for it. We surface it
  * rather than hiding it (the operator pinned it, so they expect to see it), but we
  * mark it in the display name, because the app has no concept of an offline agent
@@ -29,8 +34,8 @@
 
 export type LiveSession = { id: string; name?: string | null }
 
-/** A probe-confirmed, connected agent client. */
-export type ConfirmedAgent = {
+/** A connected agent client. Reachable whether or not it has answered a probe. */
+export type ReachableAgent = {
   agentId: string
   jobId?: string
   name: string
@@ -48,29 +53,29 @@ export type ListedAgent = {
 export const UNREACHABLE_SUFFIX = ' (no channel)'
 
 /**
- * Merge confirmed clients with pinned live sessions into the app-facing list.
+ * Merge connected clients with pinned live sessions into the app-facing list.
  *
- * Confirmed agents keep `agentId` as their id — NOT the job id — so that session
+ * Connected agents keep `agentId` as their id — NOT the job id — so that session
  * keys already stored on paired devices (`agent:spongebob:clawvibe:app:<dev>`) keep
  * routing. Pin-only rows have no meaningful agent id to use (every generic bg job
  * reports agentId "claude", the agent *type*, so they would all collapse into one
  * row), and are keyed by their unique job id instead.
  */
 export function mergeAgentList(
-  confirmed: ConfirmedAgent[],
+  connected: ReachableAgent[],
   pinnedLive: LiveSession[],
 ): ListedAgent[] {
-  const rows: ListedAgent[] = confirmed.map(c => ({
+  const rows: ListedAgent[] = connected.map(c => ({
     id: c.agentId,
     name: c.name,
     emoji: c.emoji,
     reachable: true,
   }))
 
-  // A confirmed client IS its pinned session — dedupe on the job id so a managed
-  // agent (pinned by `agents up` AND confirmed) appears exactly once, as the
+  // A connected client IS its pinned session — dedupe on the job id so a managed
+  // agent (pinned by `agents up` AND connected) appears exactly once, as the
   // reachable row.
-  const claimed = new Set(confirmed.map(c => c.jobId).filter((j): j is string => !!j))
+  const claimed = new Set(connected.map(c => c.jobId).filter((j): j is string => !!j))
 
   for (const s of pinnedLive) {
     if (claimed.has(s.id)) continue

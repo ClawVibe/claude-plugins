@@ -34,7 +34,7 @@ import {
 } from './shared/protocol.ts'
 import {
   mergeAgentList, defaultAgentId,
-  type ConfirmedAgent, type LiveSession, type ListedAgent,
+  type ReachableAgent, type LiveSession, type ListedAgent,
 } from './shared/listing.ts'
 import { pinnedLiveSessions } from './shared/sessions.ts'
 
@@ -84,9 +84,10 @@ process.on('unhandledRejection', err => {
 // ── Agent registry (IPC) ──────────────────────────────────────────────────────
 
 type SockState = { decode: (chunk: Uint8Array) => void; agentId?: string; connId?: string }
-// identity + confirmed are learned from the agent's replies, not from registration:
-// an agent is listed to the app only once it has answered a probe (confirmed), and
-// its name/emoji are refreshed from every reply (so mid-flight changes propagate).
+// identity is learned from the agent's replies, not from registration, and refreshes on
+// every reply (so mid-flight changes propagate). `confirmed` records that an agent has
+// answered at least one probe. Since issue #25 it no longer GATES reachability or routing
+// -- a live connection does that -- it only breaks ties and supplies a real display name.
 type AgentConn = {
   connId: string
   agentId: string
@@ -105,6 +106,9 @@ type AgentConn = {
 // *type* and collides between concurrent sessions; keying on it made each new client
 // evict the incumbent, whose instant reconnect evicted the newcomer, forever.
 // Several clients may therefore share one agentId — resolve via connForAgent().
+/** The agent *type* every generic background job reports. Useless as an identity. */
+const GENERIC_AGENT_ID = 'claude'
+
 const agentClients = new Map<string, AgentConn>()
 
 /** Newest live connection for an agent id, preferring a confirmed one. */
@@ -132,13 +136,35 @@ function connForJob(jobId: string): AgentConn | undefined {
   return best
 }
 
-/** One entry per agentId (newest confirmed connection), for app-facing listings. */
-function confirmedAgents(): AgentConn[] {
+/**
+ * One entry per agentId (newest connection, confirmed winning ties), for app-facing
+ * listings.
+ *
+ * A LIVE CONNECTION is the reachability test, NOT `confirmed` (issue #25). Confirmation
+ * costs the agent an inference turn, and the probe that earns it races session boot: when
+ * `agents up` starts every agent at once each is probed while still booting, misses it,
+ * and the retry ladder then gave up permanently. Those agents were listed as pin rows
+ * suffixed "(no channel)" while their clients sat connected on the IPC socket, and the
+ * job-id route refused to deliver to them. Delivery is the better test: if a client is
+ * connected, hand it the message.
+ *
+ * UNCONFIRMED clients on the generic catch-all agentId "claude" are the one exception:
+ * every generic bg job reports it, so listing them by agentId would collapse unrelated
+ * sessions into a single row. They stay pin-keyed (see mergeAgentList). A CONFIRMED
+ * "claude" client has proven it is a real channel agent and is listed as before --
+ * dropping it here regressed test:storm.
+ */
+function reachableAgents(): AgentConn[] {
   const byAgent = new Map<string, AgentConn>()
   for (const c of agentClients.values()) {
-    if (!c.confirmed) continue
+    if (!c.agentId) continue
+    if (c.agentId === GENERIC_AGENT_ID && !c.confirmed) continue
     const prev = byAgent.get(c.agentId)
-    if (!prev || c.registeredAt > prev.registeredAt) byAgent.set(c.agentId, c)
+    if (!prev
+      || (c.confirmed && !prev.confirmed)
+      || (c.confirmed === prev.confirmed && c.registeredAt > prev.registeredAt)) {
+      byAgent.set(c.agentId, c)
+    }
   }
   return [...byAgent.values()]
 }
@@ -151,7 +177,10 @@ function writeIpc(sock: Socket<SockState>, frame: IpcFrame): void {
 
 /** Choose an agent when the sessionKey carries none (legacy / device:<id>). */
 function pickFallbackAgentId(): string | null {
-  for (const c of agentClients.values()) if (c.confirmed) return c.agentId // first confirmed
+  for (const c of agentClients.values()) if (c.confirmed) return c.agentId // prefer confirmed
+  // No confirmation anywhere is not the same as no agent: an unanswered probe must not
+  // strand a legacy `device:<id>` session key with nowhere to go (issue #25).
+  for (const c of agentClients.values()) if (c.agentId && c.agentId !== GENERIC_AGENT_ID) return c.agentId
   return null
 }
 
@@ -382,12 +411,14 @@ function routeInbound(sessionKey: string, runId: string, text: string, meta: Inb
   // agentId first, job id second: a device paired before pin-keyed listing still
   // holds `agent:spongebob:…` session keys, and those must keep routing.
   //
-  // The job-id path requires CONFIRMED, unlike the agentId path. A pinned session
-  // usually has no --channels, and its client (the plugin merely being enabled) will
-  // accept the IPC frame and then do nothing with it — the app would spin until the
-  // 5-minute activeRuns TTL. Refusing here turns that into an immediate error.
+  // Neither path requires CONFIRMED any more (issue #25). It was required here on the
+  // theory that a pin-keyed target has no --channels and its client would swallow the
+  // frame until the 5-minute activeRuns TTL. In practice it also refused agents that were
+  // launched WITH --channels and merely missed their boot-time probe, which is the far
+  // more common case. An undeliverable send now surfaces as that TTL abort instead of an
+  // instant refusal — trying and timing out beats refusing to try.
   const byJob = agentId ? connForJob(agentId) : undefined
-  const conn = (agentId ? connForAgent(agentId) : undefined) ?? (byJob?.confirmed ? byJob : undefined)
+  const conn = (agentId ? connForAgent(agentId) : undefined) ?? byJob
   if (!conn) {
     process.stderr.write(`clawvibe-daemon: no agent for session=${sessionKey} (agentId=${agentId})\n`)
     return false
@@ -609,15 +640,19 @@ function kickPinnedRefresh(): void {
   if (Date.now() - lastPinnedRefresh > PINNED_KICK_MS) refreshPinnedSnapshot()
 }
 
-/** The app-facing agent list: confirmed clients + pinned live sessions. */
+/** The app-facing agent list: connected clients + pinned live sessions. */
 function listedAgents(): ListedAgent[] {
-  const confirmed: ConfirmedAgent[] = confirmedAgents().map(c => ({
+  const reachable: ReachableAgent[] = reachableAgents().map(c => ({
     agentId: c.agentId,
     jobId: c.jobId,
-    name: c.identity?.name ?? c.agentId,
+    // An unconfirmed client has no identity yet (identity arrives with its first reply),
+    // so fall back to the runtime's session name before the bare agent id.
+    name: c.identity?.name
+      ?? (c.jobId ? pinnedSnapshot.find(s => s.id === c.jobId)?.name?.trim() || undefined : undefined)
+      ?? c.agentId,
     emoji: c.identity?.emoji ?? null,
   }))
-  return mergeAgentList(confirmed, pinnedSnapshot)
+  return mergeAgentList(reachable, pinnedSnapshot)
 }
 
 function handleAgentsList(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
