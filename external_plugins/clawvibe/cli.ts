@@ -43,7 +43,13 @@ const REPLY_TOOLS = ['mcp__plugin_clawvibe_clawvibe__reply', 'mcp__plugin_clawvi
 // but keeping the agent in a waiting state is what makes survival deterministic.
 const SEED = 'You are online as a ClawVibe channel agent. Wait for device messages; when one arrives, reply to it using the clawvibe reply tool, then go straight back to waiting. This is a standing assignment, not a task: you are never finished, so always end your turn standing by rather than reporting your work complete. Take no other action while waiting.'
 
-type ManagedAgent = { id: string; model?: string }
+// `channels` are EXTRA channel servers this agent listens on, appended after the
+// mandatory ClawVibe one. The CLI only registers notifications/claude/channel
+// pushes for servers named in --channels, so an agent that is also reachable on,
+// say, Telegram must name that server here or its inbound messages are dropped
+// with "server telegram not in --channels list for this session". Omitted means
+// ClawVibe only — the historical behaviour.
+type ManagedAgent = { id: string; model?: string; channels?: string[] }
 
 const C = { dim: (s: string) => `\x1b[2m${s}\x1b[0m`, ok: (s: string) => `\x1b[32m${s}\x1b[0m`, warn: (s: string) => `\x1b[33m${s}\x1b[0m`, err: (s: string) => `\x1b[31m${s}\x1b[0m` }
 
@@ -240,7 +246,9 @@ async function cmdAgentsUp(): Promise<number> {
       continue
     }
     const cmd = [
-      'claude', '--bg', '--channels', CHANNEL, '--agent', a.id,
+      // --channels is variadic, so extra servers are appended as bare values
+      // directly after CHANNEL, before the next flag.
+      'claude', '--bg', '--channels', CHANNEL, ...(a.channels ?? []), '--agent', a.id,
       // `auto`, not `acceptEdits`: a channel agent runs unattended, so there is nobody
       // to answer a prompt. Valid modes on 2.1.220 are acceptEdits | auto |
       // bypassPermissions | manual | dontAsk | plan — verified against the CLI before
