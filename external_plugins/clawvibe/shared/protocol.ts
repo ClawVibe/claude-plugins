@@ -144,6 +144,20 @@ export function agentIdFromSessionKey(sessionKey: string | undefined | null): st
   return m ? m[1] : null
 }
 
+/**
+ * Companion to `agentIdFromSessionKey`: pulls the target device out of the
+ * same key. The app builds it as "agent:<agentId>:clawvibe:app:<deviceId>", so
+ * the key names the device it came from and a reply can be routed home without
+ * an active run to carry the id (issue #29).
+ *
+ * Returns null for `device:<id>` / probe / malformed keys.
+ */
+export function deviceIdFromSessionKey(sessionKey: string | undefined | null): string | null {
+  if (!sessionKey) return null
+  const m = /^agent:[^:]+:clawvibe:app:(.+)$/.exec(sessionKey)
+  return m ? m[1] : null
+}
+
 // ── NDJSON framing ───────────────────────────────────────────────────────────
 
 /** Serialize an IPC frame to a single newline-terminated line. */
