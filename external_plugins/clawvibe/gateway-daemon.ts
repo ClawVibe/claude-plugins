@@ -28,7 +28,7 @@ import {
   type ApprovedDevice,
 } from './shared/access.ts'
 import {
-  agentIdFromSessionKey, makeLineDecoder, encodeFrame,
+  agentIdFromSessionKey, deviceIdFromSessionKey, makeLineDecoder, encodeFrame,
   type RequestFrame, type ResponseFrame, type EventFrame, type WSData,
   type ChatState, type InboundMeta, type AgentIdentity, type IpcFrame,
 } from './shared/protocol.ts'
@@ -251,24 +251,38 @@ function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
       // A probe reply confirms liveness/identity (handled above) but is not device-facing.
       if (frame.sessionKey.startsWith('clawvibe:probe')) return
 
+      // An agent may message a device unprompted, with no active run (#29).
+      // activeRuns was doing two jobs: proving the conversation is live, and
+      // carrying deviceId for routing. Only routing is needed to deliver, and
+      // the sessionKey already names its device — so a missing run is no
+      // longer a reason to discard the message. It used to be, silently,
+      // while the fire-and-forget reply told the agent "sent".
       const run = activeRuns.get(frame.sessionKey)
-      if (!run) {
-        process.stderr.write(`clawvibe-daemon: reply for unknown session ${frame.sessionKey}\n`)
+      const targetDeviceId = run?.deviceId ?? deviceIdFromSessionKey(frame.sessionKey) ?? undefined
+      if (!targetDeviceId) {
+        // Not falling back to every connected device: the key names its
+        // device, so guessing would risk another user's phone.
+        process.stderr.write(`clawvibe-daemon: reply dropped, no device in session ${frame.sessionKey}\n`)
         return
       }
-      broadcastChatEvent(frame.runId || run.runId, frame.sessionKey, frame.state, {
-        text: frame.text,
-        errorMessage: frame.errorMessage,
-        targetDeviceId: run.deviceId,
-      })
+      if (!run) {
+        process.stderr.write(`clawvibe-daemon: unprompted reply for ${frame.sessionKey} -> device ${targetDeviceId}\n`)
+      }
+      broadcastChatEvent(
+        frame.runId || run?.runId || `unprompted-${crypto.randomUUID()}`,
+        frame.sessionKey, frame.state,
+        { text: frame.text, errorMessage: frame.errorMessage, targetDeviceId })
       return
     }
     case 'edit': {
+      // Same reasoning as `reply`: an edit to an unprompted message has no run
+      // either, and dropping it would strand the message it edits (#29).
       const run = activeRuns.get(frame.sessionKey)
-      if (!run) return
+      const targetDeviceId = run?.deviceId ?? deviceIdFromSessionKey(frame.sessionKey) ?? undefined
+      if (!targetDeviceId) return
       broadcastChatEvent(frame.messageId, frame.sessionKey, 'final', {
         text: frame.text,
-        targetDeviceId: run.deviceId,
+        targetDeviceId,
       })
       return
     }

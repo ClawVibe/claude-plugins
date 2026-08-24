@@ -172,6 +172,12 @@ function agentIdFromSessionKey(sessionKey) {
   const m = /^agent:([^:]+):/.exec(sessionKey);
   return m ? m[1] : null;
 }
+function deviceIdFromSessionKey(sessionKey) {
+  if (!sessionKey)
+    return null;
+  const m = /^agent:[^:]+:clawvibe:app:(.+)$/.exec(sessionKey);
+  return m ? m[1] : null;
+}
 function encodeFrame(frame) {
   return JSON.stringify(frame) + `
 `;
@@ -447,25 +453,27 @@ function handleIpcFrame(sock, frame) {
       if (frame.sessionKey.startsWith("clawvibe:probe"))
         return;
       const run = activeRuns.get(frame.sessionKey);
-      if (!run) {
-        process.stderr.write(`clawvibe-daemon: reply for unknown session ${frame.sessionKey}
+      const targetDeviceId = run?.deviceId ?? deviceIdFromSessionKey(frame.sessionKey) ?? undefined;
+      if (!targetDeviceId) {
+        process.stderr.write(`clawvibe-daemon: reply dropped, no device in session ${frame.sessionKey}
 `);
         return;
       }
-      broadcastChatEvent(frame.runId || run.runId, frame.sessionKey, frame.state, {
-        text: frame.text,
-        errorMessage: frame.errorMessage,
-        targetDeviceId: run.deviceId
-      });
+      if (!run) {
+        process.stderr.write(`clawvibe-daemon: unprompted reply for ${frame.sessionKey} -> device ${targetDeviceId}
+`);
+      }
+      broadcastChatEvent(frame.runId || run?.runId || `unprompted-${crypto.randomUUID()}`, frame.sessionKey, frame.state, { text: frame.text, errorMessage: frame.errorMessage, targetDeviceId });
       return;
     }
     case "edit": {
       const run = activeRuns.get(frame.sessionKey);
-      if (!run)
+      const targetDeviceId = run?.deviceId ?? deviceIdFromSessionKey(frame.sessionKey) ?? undefined;
+      if (!targetDeviceId)
         return;
       broadcastChatEvent(frame.messageId, frame.sessionKey, "final", {
         text: frame.text,
-        targetDeviceId: run.deviceId
+        targetDeviceId
       });
       return;
     }
