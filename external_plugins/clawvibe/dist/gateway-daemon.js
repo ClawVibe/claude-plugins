@@ -229,12 +229,19 @@ function defaultAgentId(rows) {
 }
 
 // shared/pins.ts
-import { mkdir, stat, rm, readFile, writeFile, rename } from "fs/promises";
+import { mkdir, readFile, writeFile, rename } from "fs/promises";
 import { homedir as homedir2 } from "os";
 import { join as join2 } from "path";
+
+// shared/filelock.ts
+function lockPathFor(target) {
+  return `${target}.lock`;
+}
+
+// shared/pins.ts
 var CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? join2(homedir2(), ".claude");
 var PINS_FILE = join2(CONFIG_DIR, "jobs", "pins.json");
-var LOCK_PATH = `${PINS_FILE}.lock`;
+var LOCK_PATH = lockPathFor(PINS_FILE);
 async function readPins() {
   try {
     const parsed = JSON.parse(await readFile(PINS_FILE, "utf8"));
@@ -291,7 +298,7 @@ async function pinnedLiveSessions() {
 var plugin_default = {
   name: "clawvibe",
   description: "ClawVibe mobile channel \u2014 pair an iOS device and chat with this Claude Code instance over a secure WebSocket. Includes format directives ([SPEAK]/[TEXT]/---) for TTS-aware clients.",
-  version: "0.1.8",
+  version: "0.1.9",
   keywords: ["channel", "mobile", "ios", "clawvibe", "voice"]
 };
 
