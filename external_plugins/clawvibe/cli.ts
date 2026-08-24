@@ -11,6 +11,8 @@
  *   clawvibe agents down                 stop all clawvibe-* sessions
  *   clawvibe doctor                      diagnose install/ingress/agent problems
  *   clawvibe install-service             systemd --user unit that runs `agents up` at login/boot
+ *   clawvibe update [--ref R] [--build] [--no-restart] [--force]
+ *                                        install from GitHub without the in-app plugin flow
  *
  * Managed-agent config: $CLAWVIBE_STATE_DIR/managed-agents.json = [{ id, model? }]
  * Agent identity/persona: ~/.claude/agents/<id>.md — the gateway never reads it; the
@@ -19,7 +21,7 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync, unlinkSync, lstatSync, readdirSync, realpathSync } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { STATE_DIR, PORT, PID_FILE, SOCK_FILE } from './shared/access.ts'
 import { syncPins, readPins } from './shared/pins.ts'
 
@@ -556,6 +558,218 @@ async function cmdDoctor(): Promise<number> {
   return fails > 0 ? 1 : 0
 }
 
+// ── update ────────────────────────────────────────────────────────────────────
+
+/**
+ * Install the plugin from GitHub without Claude Code's in-app plugin flow.
+ *
+ * Claude's updater is three mechanical steps — refresh the marketplace clone, copy
+ * `external_plugins/clawvibe` into a version-named cache dir, record it in
+ * installed_plugins.json — and none of them are reachable from a terminal. That is
+ * awkward on a headless box and slow when iterating, so this reimplements them.
+ *
+ * Two deliberate choices:
+ *   - The tree is exported with `git archive`, not copied from the working tree, so
+ *     only COMMITTED files are installed. An install can therefore never silently
+ *     capture a stray edit or a local node_modules.
+ *   - The restart at the end is executed by the NEWLY installed bin, not this one.
+ *     `agents restart` compares the running gateway against the plugin the CLI was
+ *     run from, so running the old binary would check the version we just replaced
+ *     and report a mismatch that isn't real.
+ */
+
+const PLUGINS_ROOT = join(homedir(), '.claude', 'plugins')
+const MARKETPLACE_ID = 'clawvibe-plugins'
+const PLUGIN_ID = 'clawvibe'
+const PLUGIN_SUBDIR = `external_plugins/${PLUGIN_ID}`
+const REPO_URL = 'https://github.com/ClawVibe/claude-plugins.git'
+const REGISTRY_FILE = join(PLUGINS_ROOT, 'installed_plugins.json')
+const MARKETPLACES_FILE = join(PLUGINS_ROOT, 'known_marketplaces.json')
+const REGISTRY_KEY = `${PLUGIN_ID}@${MARKETPLACE_ID}`
+
+function shq(s: string): string { return `'${s.replace(/'/g, `'\\''`)}'` }
+
+/** Where Claude keeps the marketplace clone — asked, not assumed, then defaulted. */
+function marketplaceDir(): string {
+  try {
+    const j = JSON.parse(readFileSync(MARKETPLACES_FILE, 'utf8')) as Record<string, { installLocation?: string }>
+    const loc = j[MARKETPLACE_ID]?.installLocation
+    if (loc) return loc
+  } catch { /* fall through to the conventional path */ }
+  return join(PLUGINS_ROOT, 'marketplaces', MARKETPLACE_ID)
+}
+
+function manifestVersion(dir: string): string | undefined {
+  try {
+    return (JSON.parse(readFileSync(join(dir, '.claude-plugin', 'plugin.json'), 'utf8')) as { version?: string }).version
+  } catch { return undefined }
+}
+
+async function defaultBranch(dir: string): Promise<string> {
+  const r = await sh(['git', 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], dir)
+  const s = r.out.trim()
+  return r.code === 0 && s ? s.replace(/^origin\//, '') : 'main'
+}
+
+/** Prefer the REMOTE ref: `--ref main` should mean origin/main, not a stale local main. */
+async function resolveRef(dir: string, ref: string): Promise<{ sha: string; branch?: string } | undefined> {
+  const remote = await sh(['git', 'rev-parse', '--verify', '--quiet', `origin/${ref}^{commit}`], dir)
+  if (remote.code === 0 && remote.out.trim()) return { sha: remote.out.trim(), branch: ref }
+  const local = await sh(['git', 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], dir)
+  if (local.code === 0 && local.out.trim()) return { sha: local.out.trim() }
+  return undefined
+}
+
+/** Point ~/.local/bin/clawvibe at an explicit plugin dir (linkCli() only ever uses its own). */
+function linkCliTo(pluginDir: string): void {
+  mkdirSync(join(homedir(), '.local', 'bin'), { recursive: true })
+  try { if (lstatSync(LOCAL_BIN)) unlinkSync(LOCAL_BIN) } catch { /* nothing to replace */ }
+  symlinkSync(join(pluginDir, 'bin', 'clawvibe'), LOCAL_BIN)
+}
+
+/**
+ * Record the install where Claude Code looks for it.
+ *
+ * Read-modify-write of the whole file, preserving every other plugin's entry: this
+ * registry is shared, and clobbering it would uninstall unrelated plugins.
+ */
+function registerInstall(dest: string, version: string, sha: string): void {
+  let reg: { version: number; plugins: Record<string, any[]> }
+  try { reg = JSON.parse(readFileSync(REGISTRY_FILE, 'utf8')) } catch { reg = { version: 2, plugins: {} } }
+  if (!reg.plugins || typeof reg.plugins !== 'object') reg.plugins = {}
+
+  const now = new Date().toISOString()
+  const entries = Array.isArray(reg.plugins[REGISTRY_KEY]) ? reg.plugins[REGISTRY_KEY] : []
+  const i = entries.findIndex((e: any) => e?.scope === 'user')
+  const prev = i >= 0 ? entries[i] : undefined
+  const entry = {
+    ...(prev ?? {}),
+    scope: 'user',
+    installPath: dest,
+    version,
+    installedAt: prev?.installedAt ?? now,
+    lastUpdated: now,
+    gitCommitSha: sha,
+  }
+  if (i >= 0) entries[i] = entry; else entries.push(entry)
+  reg.plugins[REGISTRY_KEY] = entries
+
+  mkdirSync(PLUGINS_ROOT, { recursive: true })
+  writeFileSync(REGISTRY_FILE, JSON.stringify(reg, null, 2) + '\n')
+}
+
+async function cmdUpdate(args: string[]): Promise<number> {
+  const { flags } = parseFlags(args)
+  const force = flags.force === true
+  const build = flags.build === true
+  const restart = flags['no-restart'] !== true
+
+  console.log('clawvibe update:')
+
+  // 1. marketplace clone — create it if this is a cold machine.
+  const mkt = marketplaceDir()
+  if (!existsSync(join(mkt, '.git'))) {
+    console.log(C.dim(`  cloning ${REPO_URL} → ${mkt}`))
+    mkdirSync(dirname(mkt), { recursive: true })
+    const r = await sh(['git', 'clone', REPO_URL, mkt])
+    if (r.code !== 0) { console.log(C.err(`  clone failed: ${r.err.trim() || r.out.trim()}`)); return 1 }
+  }
+
+  // A hard reset would silently destroy uncommitted work in that clone. People do edit
+  // it in place to test a change, so refuse rather than surprise them.
+  const dirty = (await sh(['git', 'status', '--porcelain'], mkt)).out.trim()
+  if (dirty && !force) {
+    console.log(C.err(`  ${mkt} has uncommitted changes — refusing to reset over them`))
+    for (const l of dirty.split('\n').slice(0, 10)) console.log(C.dim(`    ${l}`))
+    console.log(C.dim('    commit/stash them, or re-run with --force to discard'))
+    return 1
+  }
+
+  console.log(C.dim('  fetching…'))
+  const f = await sh(['git', 'fetch', '--tags', '--prune', 'origin'], mkt)
+  if (f.code !== 0) { console.log(C.err(`  fetch failed: ${f.err.trim() || f.out.trim()}`)); return 1 }
+
+  const ref = typeof flags.ref === 'string' ? flags.ref : await defaultBranch(mkt)
+  const resolved = await resolveRef(mkt, ref)
+  if (!resolved) { console.log(C.err(`  no such ref: ${ref}`)); return 1 }
+  const { sha, branch } = resolved
+
+  // Track the branch where there is one, detach for tags and raw shas.
+  const co = branch
+    ? await sh(['git', 'checkout', '-B', branch, sha, '--'], mkt)
+    : await sh(['git', 'checkout', '--detach', sha, '--'], mkt)
+  if (co.code !== 0) { console.log(C.err(`  checkout failed: ${co.err.trim() || co.out.trim()}`)); return 1 }
+  if (branch) await sh(['git', 'reset', '--hard', sha], mkt)
+  console.log(C.dim(`  ref ${ref} → ${sha.slice(0, 8)}`))
+
+  // 2. version comes from the ref we just checked out, not from anything installed.
+  const src = join(mkt, PLUGIN_SUBDIR)
+  const version = manifestVersion(src)
+  if (!version) { console.log(C.err(`  cannot read version from ${join(src, '.claude-plugin', 'plugin.json')}`)); return 1 }
+
+  const dest = join(PLUGINS_ROOT, 'cache', MARKETPLACE_ID, PLUGIN_ID, version)
+  const installed = manifestVersion(dest)
+  if (installed === version && !force) {
+    // Same version dir AND same commit means there is genuinely nothing to do. A
+    // different commit under the same version number is exactly the case a bump would
+    // have hidden, so reinstall rather than trust the number.
+    let sameSha = false
+    try {
+      const reg = JSON.parse(readFileSync(REGISTRY_FILE, 'utf8')) as { plugins?: Record<string, any[]> }
+      sameSha = (reg.plugins?.[REGISTRY_KEY] ?? []).some((e: any) => e?.installPath === dest && e?.gitCommitSha === sha)
+    } catch { /* treat an unreadable registry as "not installed" */ }
+    if (sameSha) {
+      console.log(C.ok(`  ${version} (${sha.slice(0, 8)}) already installed ✓`))
+      console.log(C.dim('    re-run with --force to reinstall'))
+      return 0
+    }
+    console.log(C.warn(`  ${version} is installed but from a different commit — reinstalling`))
+  }
+
+  // 3. export the COMMITTED tree only. No working-tree strays, no node_modules, no .git.
+  const from = manifestVersion(PLUGIN_DIR)
+  console.log(C.dim(`  installing ${from ?? '?'} → ${version} into ${dest}`))
+  rmSync(dest, { recursive: true, force: true })
+  mkdirSync(dest, { recursive: true })
+  const ex = await sh(['bash', '-c',
+    `set -o pipefail; git -C ${shq(mkt)} archive ${shq(sha)}:${shq(PLUGIN_SUBDIR)} | tar -x -C ${shq(dest)}`])
+  if (ex.code !== 0) { console.log(C.err(`  export failed: ${ex.err.trim() || ex.out.trim()}`)); return 1 }
+
+  if (build) {
+    console.log(C.dim('  building bundle…'))
+    const i = await sh(['bun', 'install', '--cwd', dest])
+    if (i.code !== 0) { console.log(C.err(`  bun install failed: ${i.err.trim()}`)); return 1 }
+    const b = await sh(['bun', 'run', '--cwd', dest, 'build'])
+    if (b.code !== 0) { console.log(C.err(`  build failed: ${b.err.trim()}`)); return 1 }
+    // dist/ inlines the SDK, so node_modules is a build-time artifact only — 33 MB of
+    // it, per version dir, that nothing at runtime ever opens.
+    rmSync(join(dest, 'node_modules'), { recursive: true, force: true })
+  }
+  if (!existsSync(join(dest, 'dist', 'channel-client.js'))) {
+    // Agents launch from dist/. Without it they fail at spawn time, long after this
+    // command reported success, so refuse now instead.
+    console.log(C.err('  installed tree has no dist/ bundle — re-run with --build'))
+    return 1
+  }
+
+  // 4. register + relink, so both Claude Code and the shell see the new version.
+  registerInstall(dest, version, sha)
+  console.log(C.ok(`  registered ${REGISTRY_KEY} ${version} ✓`))
+  linkCliTo(dest)
+  console.log(C.ok(`  linked ${LOCAL_BIN} → ${version} ✓`))
+
+  if (!restart) {
+    console.log(C.warn('  --no-restart: agents are still running the previous bundle'))
+    console.log(C.dim('    finish with: clawvibe agents restart'))
+    return 0
+  }
+
+  // 5. hand off to the new bin (see the note at the top of this section).
+  console.log(C.dim('  restarting agents with the new bundle…'))
+  const p = Bun.spawn({ cmd: [join(dest, 'bin', 'clawvibe'), 'agents', 'restart'], stdout: 'inherit', stderr: 'inherit' })
+  return await p.exited
+}
+
 // ── setup ─────────────────────────────────────────────────────────────────────
 
 function linkCli(): void {
@@ -653,6 +867,7 @@ async function main(): Promise<number> {
     case 'doctor': return cmdDoctor()
     case 'tailscale-check': { console.log('ClawVibe ingress check:'); await checkTailscale(false); return 0 }
     case 'install-service': return cmdInstallService()
+    case 'update': return cmdUpdate([sub, ...rest].filter(Boolean))
     case 'agents':
       if (sub === 'up') return cmdAgentsUp()
       if (sub === 'down') return cmdAgentsDown()

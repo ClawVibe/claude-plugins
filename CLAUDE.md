@@ -196,8 +196,28 @@ clawvibe doctor                      # one-shot diagnostic: PATH, bun, gateway v
 clawvibe tailscale-check             # ingress form only
 clawvibe agent list                  # configured + running/registered status
 clawvibe install-service             # systemd --user unit running `agents up` at login/boot
+clawvibe update [--ref R] [--build] [--no-restart] [--force]   # install from GitHub, no in-app plugin flow
 ```
 
+- **`update` is a from-scratch reimplementation of Claude's in-app plugin update**, for
+  headless boxes and for iterating without the UI. It refreshes the marketplace clone,
+  exports `external_plugins/clawvibe` at the chosen ref with `git archive`, drops it in
+  `~/.claude/plugins/cache/clawvibe-plugins/clawvibe/<version>/`, records it in
+  `installed_plugins.json`, relinks `~/.local/bin/clawvibe`, then restarts the agents.
+  Three things worth knowing:
+  - It installs **committed files only** (`git archive`, not a copy of the working tree),
+    so a stray local edit can never end up in an install.
+  - It reinstalls when the version number matches but the **commit** doesn't — the exact
+    case a version bump would otherwise paper over. `--force` also overrides an identical
+    commit, and is the only way past a dirty marketplace clone (which is refused, since a
+    hard reset would eat uncommitted work).
+  - The final `agents restart` is run by the **newly installed** bin, not the one you
+    invoked. `agents restart` verifies the running gateway against the plugin *its own*
+    CLI came from, so the old binary would check the version it just replaced and report a
+    mismatch that isn't real.
+  `dist/` is committed, so no build happens by default; `--build` rebuilds it in place and
+  then deletes the resulting `node_modules` (the bundle inlines the SDK, so nothing at
+  runtime reads it).
 - **`install-service` requires a real user systemd session — it does NOT work in most
   containers.** It writes a `systemd --user` unit, so it needs a user D-Bus session. In a
   **Coder workspace** (and `ubuntu-clawcode`) PID 1 is the supervising agent, not systemd:

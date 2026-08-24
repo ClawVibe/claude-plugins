@@ -23,6 +23,10 @@ usage: clawvibe <command>
   doctor                         Diagnose install, PATH, ingress, gateway and agent problems.
   tailscale-check                Check the :8791 ingress is a TLS-terminated TCP forward.
   install-service                systemd --user unit that runs 'agents up' at login/boot.
+  update [--ref R] [--build]     Install the plugin from GitHub, without going through
+         [--no-restart] [--force]  Claude's in-app plugin update flow. Refreshes the
+                                   marketplace clone, installs the committed tree into
+                                   the plugin cache, relinks this CLI and restarts agents.
   qr [--text] [--no-wait]        Generate a pairing QR code.
   help                           This message.
 EOF
@@ -46,7 +50,7 @@ case "$cmd" in
     bun "$PLUGIN_DIR/cli.ts" tailscale-check || true
     exec python3 "$PLUGIN_DIR/qr.py" "$@"
     ;;
-  setup|install-service|agent|agents|doctor|tailscale-check)
+  setup|install-service|agent|agents|doctor|tailscale-check|update)
     need bun "install it from https://bun.sh" || exit 127
     exec bun "$PLUGIN_DIR/cli.ts" "$cmd" "$@"
     ;;
