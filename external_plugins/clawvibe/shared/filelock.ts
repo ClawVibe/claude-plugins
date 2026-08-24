@@ -11,12 +11,6 @@
  * Compatible with proper-lockfile by construction: it takes the lock by creating a
  * DIRECTORY at `<file>.lock`, which is atomic on POSIX, and treats a lock whose mtime
  * is older than the staleness threshold as abandoned.
- *
- * NOTE: shared/pins.ts still carries its own private copy of this logic. It predates
- * this module and is byte-for-byte the same; it is left alone deliberately, because
- * pins.ts is bundled into dist/ and switching it over would force a dist rebuild in a
- * change that otherwise touches only cli.ts. Consolidate it the next time dist/ is
- * rebuilt for another reason — `bun run test:pins` covers that refactor.
  */
 
 import { mkdir, stat, rm } from 'fs/promises'

@@ -26,64 +26,17 @@
  * still needed for that case — but it is a backstop, not the primary mechanism.
  */
 
-import { mkdir, stat, rm, readFile, writeFile, rename } from 'fs/promises'
+import { mkdir, readFile, writeFile, rename } from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
 
+import { acquireLock, releaseLock, lockPathFor } from './filelock.ts'
+
 const CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
 export const PINS_FILE = join(CONFIG_DIR, 'jobs', 'pins.json')
-const LOCK_PATH = `${PINS_FILE}.lock`
+const LOCK_PATH = lockPathFor(PINS_FILE)
 
-// Mirrors proper-lockfile as the runtime configures it (stale: 5000, minTimeout: 20),
-// except for the retry count: the runtime uses 5 (~0.6s total). We use 8 (~5.1s), which
-// exceeds the staleness threshold, so an abandoned lock is broken inside a single call
-// rather than needing a later one. Our cost of giving up is higher than the runtime's —
-// a skipped pin means the agent silently dies an hour later.
-const LOCK_STALE_MS = 5_000
-const LOCK_MAX_WAIT_MS = 6_000
-const LOCK_MIN_TIMEOUT_MS = 20
-
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const warn = (msg: string) => process.stderr.write(`clawvibe-pins: ${msg}\n`)
-
-/**
- * proper-lockfile takes the lock by creating a DIRECTORY, which is atomic on POSIX.
- *
- * Deadline-bounded rather than attempt-bounded, deliberately: an attempt-counted loop
- * can spend its LAST attempt breaking a stale lock and then fall out without retrying
- * the mkdir — removing another process's lock file and still failing to acquire. Any
- * successful stale-break must be followed by another acquisition attempt.
- */
-async function acquireLock(): Promise<boolean> {
-  const deadline = Date.now() + LOCK_MAX_WAIT_MS
-  let backoff = LOCK_MIN_TIMEOUT_MS
-  for (;;) {
-    try {
-      await mkdir(LOCK_PATH)
-      return true
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
-      // Held by someone else — break it only if it is provably stale. A live
-      // proper-lockfile holder refreshes the mtime, so it will not look stale.
-      let broke = false
-      try {
-        const st = await stat(LOCK_PATH)
-        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-          await rm(LOCK_PATH, { recursive: true, force: true })
-          broke = true
-        }
-      } catch { /* vanished between mkdir and stat — fall through and retry */ }
-      if (broke) continue // retry mkdir immediately; never end the loop on a break
-      if (Date.now() >= deadline) return false
-      await sleep(Math.min(backoff, 500) + Math.random() * LOCK_MIN_TIMEOUT_MS)
-      backoff *= 2
-    }
-  }
-}
-
-async function releaseLock(): Promise<void> {
-  try { await rm(LOCK_PATH, { recursive: true, force: true }) } catch { /* best effort */ }
-}
 
 /** Current pin set. Tolerates a missing, empty, corrupt, or non-array file. */
 export async function readPins(): Promise<string[]> {
@@ -107,7 +60,7 @@ export async function syncPins(opts: { add?: string[]; remove?: string[] }): Pro
 
   let locked = false
   try {
-    locked = await acquireLock()
+    locked = await acquireLock(PINS_FILE)
     if (!locked) { warn(`could not acquire ${LOCK_PATH} — skipping (agent still runs, just unpinned)`); return false }
 
     const before = await readPins()
@@ -127,7 +80,7 @@ export async function syncPins(opts: { add?: string[]; remove?: string[] }): Pro
     warn(`syncPins failed: ${err}`) // swallow — never break the caller
     return false
   } finally {
-    if (locked) await releaseLock()
+    if (locked) await releaseLock(PINS_FILE)
   }
 }
 

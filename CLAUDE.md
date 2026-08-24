@@ -227,8 +227,7 @@ clawvibe update [--ref R] [--build] [--no-restart] [--force]   # install from Gi
   - `installed_plugins.json` is read-modify-written under `shared/filelock.ts` — the same
     directory-lock discipline `pins.ts` uses for `pins.json` — because Claude Code's
     in-app flow writes that file too and a lost write uninstalls an unrelated plugin.
-    (`pins.ts` still has its own identical private copy; it is bundled into `dist/`, so
-    consolidating the two is deferred to the next change that rebuilds `dist/` anyway.) The whole command also holds a lock, so two concurrent updates can't
+    `pins.ts` uses the same module (consolidated in 0.1.9). The whole command also holds a lock, so two concurrent updates can't
     interleave `fetch`/`checkout` in one working tree.
   - A failed `git fetch` is a warning, not an error: reinstalling an already-fetched ref
     while offline is legitimate, and an genuinely missing ref fails more clearly below.
