@@ -166,7 +166,7 @@ Key mechanics:
 - **Pin-only rows are listed but NOT reachable**, with `reachable: false` and a ` (no channel)` name suffix. A pinned session without `--channels` has no way to turn an inbound into a turn — that is structural (see the probe model above), not a bug to code around. The suffix exists because the app has no concept of an offline agent and would otherwise show a row that silently swallows every message. **A row is pin-only when no client is CONNECTED for that job id — not when the client hasn't answered a probe (issue #25).** Note the app never reads `reachable`: `AgentSummary` in the iOS app doesn't decode the field, so the suffix is the only visible signal, and nothing app-side blocks a send to such a row.
 - **Connected rows keep `agentId` as their id**, so session keys already stored on paired devices (`agent:spongebob:…`) keep routing. Pin-only rows are keyed by job id because every generic bg job reports `agentId` `"claude"` and they would otherwise collapse into one row; clients reporting that generic id are excluded from the connected list for the same reason. Routing resolves agentId first, then job id, and **neither path requires `confirmed` any more (issue #25)** — it used to, which refused delivery to agents that were launched with `--channels` and had merely missed their boot-time probe.
 - **Never resolve the roster in an RPC handler** — it costs a subprocess spawn. The daemon keeps a snapshot refreshed on the 30s tick (plus a 5s-throttled kick from `agents.list`); handlers stay synchronous. If `claude` isn't on the daemon's PATH (likely in the container), the roster is empty and the list degrades to connected-clients-only — the pre-0.1.7 behaviour.
-- Tests: `bun run test:listing`, and `bun run test:reachability` (end-to-end: a client that registers and never answers its probe must still be listed reachable by agentId — issue #25). Note `test:storm` asserts only on `reachable` rows, because `pins.json` is the real machine's file and is deliberately **not** redirected by `CLAWVIBE_STATE_DIR`.
+- Tests: `bun run test:update` (installer safety), `bun run test:listing`, and `bun run test:reachability` (end-to-end: a client that registers and never answers its probe must still be listed reachable by agentId — issue #25). Note `test:storm` asserts only on `reachable` rows, because `pins.json` is the real machine's file and is deliberately **not** redirected by `CLAWVIBE_STATE_DIR`.
 
 *Known gap:* nothing sweeps a pin when its session dies, so corpses accumulate. Harmless now that the list intersects with the live roster, but `pins.json` grows unbounded.
 
@@ -196,8 +196,45 @@ clawvibe doctor                      # one-shot diagnostic: PATH, bun, gateway v
 clawvibe tailscale-check             # ingress form only
 clawvibe agent list                  # configured + running/registered status
 clawvibe install-service             # systemd --user unit running `agents up` at login/boot
+clawvibe update [--ref R] [--build] [--no-restart] [--force]   # install from GitHub, no in-app plugin flow
 ```
 
+- **`update` is a from-scratch reimplementation of Claude's in-app plugin update**, for
+  headless boxes and for iterating without the UI. It refreshes the marketplace clone,
+  exports `external_plugins/clawvibe` at the chosen ref with `git archive`, drops it in
+  `~/.claude/plugins/cache/clawvibe-plugins/clawvibe/<version>/`, records it in
+  `installed_plugins.json`, relinks `~/.local/bin/clawvibe`, then restarts the agents.
+  Three things worth knowing:
+  - It installs **committed files only** (`git archive`, not a copy of the working tree),
+    so a stray local edit can never end up in an install.
+  - It reinstalls when the version number matches but the **commit** doesn't — the exact
+    case a version bump would otherwise paper over. `--force` also overrides an identical
+    commit, and is the only way past a dirty marketplace clone (which is refused, since a
+    hard reset would eat uncommitted work).
+  - The final `agents restart` is run by the **newly installed** bin, not the one you
+    invoked. `agents restart` verifies the running gateway against the plugin *its own*
+    CLI came from, so the old binary would check the version it just replaced and report a
+    mismatch that isn't real.
+  - **It never deletes the live install before the replacement is known-good.** The
+    destination is usually the directory the running daemon and every agent client are
+    executing from, so the export goes to a `.incoming-<pid>` sibling, gets verified
+    (`dist/channel-client.js`, `dist/gateway-daemon.js`, `bin/clawvibe`), and is then
+    swapped in with two `rename`s. A failed download or build leaves the previous install
+    untouched. Regression test: `bun run test:update`.
+  - The manifest version becomes a directory name that later gets `rmSync`'d, so it is
+    validated against `/^[A-Za-z0-9][A-Za-z0-9._+-]*$/` first — a version containing `..`
+    or `/` would otherwise escape the cache.
+  - `installed_plugins.json` is read-modify-written under `shared/filelock.ts` — the same
+    directory-lock discipline `pins.ts` uses for `pins.json` — because Claude Code's
+    in-app flow writes that file too and a lost write uninstalls an unrelated plugin.
+    (`pins.ts` still has its own identical private copy; it is bundled into `dist/`, so
+    consolidating the two is deferred to the next change that rebuilds `dist/` anyway.) The whole command also holds a lock, so two concurrent updates can't
+    interleave `fetch`/`checkout` in one working tree.
+  - A failed `git fetch` is a warning, not an error: reinstalling an already-fetched ref
+    while offline is legitimate, and an genuinely missing ref fails more clearly below.
+  `dist/` is committed, so no build happens by default; `--build` rebuilds it in place and
+  then deletes the resulting `node_modules` (the bundle inlines the SDK, so nothing at
+  runtime reads it).
 - **`install-service` requires a real user systemd session — it does NOT work in most
   containers.** It writes a `systemd --user` unit, so it needs a user D-Bus session. In a
   **Coder workspace** (and `ubuntu-clawcode`) PID 1 is the supervising agent, not systemd:

@@ -11,7 +11,8 @@
     "test:pins": "bun test/pins.test.ts",
     "test:listing": "bun test/listing.ts",
     "test:reachability": "bun test/reachability.ts",
-    "test:unprompted": "bun test/unprompted.ts"
+    "test:unprompted": "bun test/unprompted.ts",
+    "test:update": "bun test/update.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
