@@ -19,11 +19,12 @@
  * agent reports its own name/emoji on every `reply` (see channel-client instructions).
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync, unlinkSync, lstatSync, readdirSync, realpathSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, renameSync, symlinkSync, unlinkSync, lstatSync, readdirSync, realpathSync } from 'fs'
 import { homedir } from 'os'
 import { dirname, join } from 'path'
 import { STATE_DIR, PORT, PID_FILE, SOCK_FILE } from './shared/access.ts'
 import { syncPins, readPins } from './shared/pins.ts'
+import { withLock } from './shared/filelock.ts'
 
 const PLUGIN_DIR = import.meta.dir
 const AGENTS_DIR = join(homedir(), '.claude', 'agents')
@@ -599,9 +600,19 @@ function marketplaceDir(): string {
   return join(PLUGINS_ROOT, 'marketplaces', MARKETPLACE_ID)
 }
 
+/**
+ * The manifest version doubles as a DIRECTORY NAME under the plugin cache, and that
+ * directory later gets rmSync'd. A version containing `/` or `..` — from a malformed
+ * manifest, a bad merge, or a ref that isn't fully trusted — would therefore escape the
+ * cache and delete whatever it resolved to. Anything that isn't a plain version-ish
+ * token is rejected here, before it can reach a path.
+ */
+const SAFE_VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/
+
 function manifestVersion(dir: string): string | undefined {
   try {
-    return (JSON.parse(readFileSync(join(dir, '.claude-plugin', 'plugin.json'), 'utf8')) as { version?: string }).version
+    const v = (JSON.parse(readFileSync(join(dir, '.claude-plugin', 'plugin.json'), 'utf8')) as { version?: string }).version
+    return typeof v === 'string' && SAFE_VERSION.test(v) ? v : undefined
   } catch { return undefined }
 }
 
@@ -631,9 +642,16 @@ function linkCliTo(pluginDir: string): void {
  * Record the install where Claude Code looks for it.
  *
  * Read-modify-write of the whole file, preserving every other plugin's entry: this
- * registry is shared, and clobbering it would uninstall unrelated plugins.
+ * registry is shared, and clobbering it would uninstall unrelated plugins. Claude Code's
+ * own in-app plugin flow writes this same file, so the read-modify-write happens under
+ * the lock — the identical hazard shared/pins.ts documents for pins.json, where a bare
+ * write silently drops the other writer's change.
  */
-function registerInstall(dest: string, version: string, sha: string): void {
+async function registerInstall(dest: string, version: string, sha: string): Promise<boolean> {
+  return await withLock(REGISTRY_FILE, () => { writeRegistry(dest, version, sha); return true }) ?? false
+}
+
+function writeRegistry(dest: string, version: string, sha: string): void {
   let reg: { version: number; plugins: Record<string, any[]> }
   try { reg = JSON.parse(readFileSync(REGISTRY_FILE, 'utf8')) } catch { reg = { version: 2, plugins: {} } }
   if (!reg.plugins || typeof reg.plugins !== 'object') reg.plugins = {}
@@ -659,6 +677,21 @@ function registerInstall(dest: string, version: string, sha: string): void {
 }
 
 async function cmdUpdate(args: string[]): Promise<number> {
+  // Two concurrent updates share one git working tree; interleaved fetch/checkout/reset
+  // would leave it inconsistent and could hand the export a half-switched ref. Serialise
+  // the whole command rather than trying to make the steps individually safe.
+  // The lock is a directory created alongside this path, so its parent must exist —
+  // on a cold machine ~/.claude/plugins may not yet.
+  mkdirSync(PLUGINS_ROOT, { recursive: true })
+  const held = await withLock(join(PLUGINS_ROOT, `.${MARKETPLACE_ID}-update`), () => cmdUpdateLocked(args))
+  if (held === undefined) {
+    console.log(C.err('  another clawvibe update is already running — try again in a moment'))
+    return 1
+  }
+  return held
+}
+
+async function cmdUpdateLocked(args: string[]): Promise<number> {
   const { flags } = parseFlags(args)
   const force = flags.force === true
   const build = flags.build === true
@@ -668,11 +701,13 @@ async function cmdUpdate(args: string[]): Promise<number> {
 
   // 1. marketplace clone — create it if this is a cold machine.
   const mkt = marketplaceDir()
+  let justCloned = false
   if (!existsSync(join(mkt, '.git'))) {
     console.log(C.dim(`  cloning ${REPO_URL} → ${mkt}`))
     mkdirSync(dirname(mkt), { recursive: true })
     const r = await sh(['git', 'clone', REPO_URL, mkt])
     if (r.code !== 0) { console.log(C.err(`  clone failed: ${r.err.trim() || r.out.trim()}`)); return 1 }
+    justCloned = true
   }
 
   // A hard reset would silently destroy uncommitted work in that clone. People do edit
@@ -685,21 +720,28 @@ async function cmdUpdate(args: string[]): Promise<number> {
     return 1
   }
 
-  console.log(C.dim('  fetching…'))
-  const f = await sh(['git', 'fetch', '--tags', '--prune', 'origin'], mkt)
-  if (f.code !== 0) { console.log(C.err(`  fetch failed: ${f.err.trim() || f.out.trim()}`)); return 1 }
+  // A failed fetch is a warning, not a stop. Offline, or with GitHub having a bad day,
+  // reinstalling an already-fetched ref is still a perfectly good thing to want; if the
+  // ref genuinely isn't here, ref resolution below fails with a clearer message anyway.
+  if (!justCloned) {
+    console.log(C.dim('  fetching…'))
+    const f = await sh(['git', 'fetch', '--tags', '--prune', 'origin'], mkt)
+    if (f.code !== 0) console.log(C.warn(`  fetch failed, using what is already cloned: ${(f.err.trim() || f.out.trim()).split('\n')[0]}`))
+  }
 
   const ref = typeof flags.ref === 'string' ? flags.ref : await defaultBranch(mkt)
   const resolved = await resolveRef(mkt, ref)
   if (!resolved) { console.log(C.err(`  no such ref: ${ref}`)); return 1 }
   const { sha, branch } = resolved
 
-  // Track the branch where there is one, detach for tags and raw shas.
+  // Track the branch where there is one, detach for tags and raw shas. `checkout -B`
+  // already moves the branch tip and the working tree to <sha>, so no reset is needed.
   const co = branch
     ? await sh(['git', 'checkout', '-B', branch, sha, '--'], mkt)
     : await sh(['git', 'checkout', '--detach', sha, '--'], mkt)
   if (co.code !== 0) { console.log(C.err(`  checkout failed: ${co.err.trim() || co.out.trim()}`)); return 1 }
-  if (branch) await sh(['git', 'reset', '--hard', sha], mkt)
+  // A --force run may have arrived here over a dirty tree; discard what checkout kept.
+  if (force) await sh(['git', 'reset', '--hard', sha], mkt)
   console.log(C.dim(`  ref ${ref} → ${sha.slice(0, 8)}`))
 
   // 2. version comes from the ref we just checked out, not from anything installed.
@@ -726,34 +768,71 @@ async function cmdUpdate(args: string[]): Promise<number> {
     console.log(C.warn(`  ${version} is installed but from a different commit — reinstalling`))
   }
 
-  // 3. export the COMMITTED tree only. No working-tree strays, no node_modules, no .git.
+  // 3. Build the new tree BESIDE the live one, never on top of it.
+  //
+  // `dest` is frequently the directory the running daemon and every agent client are
+  // executing from — the same-version-different-commit and --force paths both reinstall
+  // in place. Deleting it before the replacement is known-good means a failed export
+  // (network blip, full disk, tar error) leaves NO plugin installed at all and every
+  // subsequent agent spawn broken. So: export to a sibling, verify it, and only then
+  // swap, keeping the old tree until the swap has succeeded.
   const from = manifestVersion(PLUGIN_DIR)
   console.log(C.dim(`  installing ${from ?? '?'} → ${version} into ${dest}`))
-  rmSync(dest, { recursive: true, force: true })
-  mkdirSync(dest, { recursive: true })
+
+  const staging = `${dest}.incoming-${process.pid}`
+  const retired = `${dest}.previous-${process.pid}`
+  const scrub = () => rmSync(staging, { recursive: true, force: true })
+
+  rmSync(staging, { recursive: true, force: true })
+  mkdirSync(staging, { recursive: true })
   const ex = await sh(['bash', '-c',
-    `set -o pipefail; git -C ${shq(mkt)} archive ${shq(sha)}:${shq(PLUGIN_SUBDIR)} | tar -x -C ${shq(dest)}`])
-  if (ex.code !== 0) { console.log(C.err(`  export failed: ${ex.err.trim() || ex.out.trim()}`)); return 1 }
+    `set -o pipefail; git -C ${shq(mkt)} archive ${shq(sha)}:${shq(PLUGIN_SUBDIR)} | tar -x -C ${shq(staging)}`])
+  if (ex.code !== 0) { scrub(); console.log(C.err(`  export failed: ${ex.err.trim() || ex.out.trim()}`)); return 1 }
 
   if (build) {
     console.log(C.dim('  building bundle…'))
-    const i = await sh(['bun', 'install', '--cwd', dest])
-    if (i.code !== 0) { console.log(C.err(`  bun install failed: ${i.err.trim()}`)); return 1 }
-    const b = await sh(['bun', 'run', '--cwd', dest, 'build'])
-    if (b.code !== 0) { console.log(C.err(`  build failed: ${b.err.trim()}`)); return 1 }
+    const i = await sh(['bun', 'install', '--cwd', staging])
+    if (i.code !== 0) { scrub(); console.log(C.err(`  bun install failed: ${i.err.trim()}`)); return 1 }
+    const b = await sh(['bun', 'run', '--cwd', staging, 'build'])
+    if (b.code !== 0) { scrub(); console.log(C.err(`  build failed: ${b.err.trim()}`)); return 1 }
     // dist/ inlines the SDK, so node_modules is a build-time artifact only — 33 MB of
     // it, per version dir, that nothing at runtime ever opens.
-    rmSync(join(dest, 'node_modules'), { recursive: true, force: true })
+    rmSync(join(staging, 'node_modules'), { recursive: true, force: true })
   }
-  if (!existsSync(join(dest, 'dist', 'channel-client.js'))) {
-    // Agents launch from dist/. Without it they fail at spawn time, long after this
-    // command reported success, so refuse now instead.
-    console.log(C.err('  installed tree has no dist/ bundle — re-run with --build'))
+
+  // Agents launch from dist/ and the CLI symlink points at bin/clawvibe. A tree missing
+  // either fails much later — at agent spawn, or on the next shell invocation — long
+  // after this command claimed success. Check while the old install is still intact.
+  for (const rel of [join('dist', 'channel-client.js'), join('dist', 'gateway-daemon.js'), join('bin', 'clawvibe')]) {
+    if (existsSync(join(staging, rel))) continue
+    scrub()
+    console.log(C.err(`  exported tree is missing ${rel} — refusing to install it`))
+    if (rel.startsWith('dist')) console.log(C.dim('    dist/ is committed; if this ref genuinely lacks it, re-run with --build'))
     return 1
   }
 
+  // Swap. rename() is atomic, so the window in which `dest` does not exist is the gap
+  // between two renames rather than the whole download-and-build.
+  try {
+    if (existsSync(dest)) renameSync(dest, retired)
+    renameSync(staging, dest)
+  } catch (err) {
+    // Put it back if we got as far as moving the old one out of the way.
+    try { if (!existsSync(dest) && existsSync(retired)) renameSync(retired, dest) } catch { /* nothing further we can do */ }
+    scrub()
+    console.log(C.err(`  install failed: ${err}`))
+    console.log(C.dim(`    previous install left in place at ${dest}`))
+    return 1
+  }
+  rmSync(retired, { recursive: true, force: true })
+
   // 4. register + relink, so both Claude Code and the shell see the new version.
-  registerInstall(dest, version, sha)
+  if (!await registerInstall(dest, version, sha)) {
+    // The files are in place, so the agents will run the new code; only Claude Code's
+    // view of it is stale. Worth failing loudly, not worth rolling back.
+    console.log(C.err(`  could not lock ${REGISTRY_FILE} — installed, but not registered`))
+    return 1
+  }
   console.log(C.ok(`  registered ${REGISTRY_KEY} ${version} ✓`))
   linkCliTo(dest)
   console.log(C.ok(`  linked ${LOCAL_BIN} → ${version} ✓`))
