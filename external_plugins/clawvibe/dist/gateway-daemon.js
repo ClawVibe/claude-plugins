@@ -287,6 +287,16 @@ async function pinnedLiveSessions() {
   const pinned = new Set(pins);
   return sessions.filter((s) => pinned.has(s.id));
 }
+// .claude-plugin/plugin.json
+var plugin_default = {
+  name: "clawvibe",
+  description: "ClawVibe mobile channel \u2014 pair an iOS device and chat with this Claude Code instance over a secure WebSocket. Includes format directives ([SPEAK]/[TEXT]/---) for TTS-aware clients.",
+  version: "0.1.8",
+  keywords: ["channel", "mobile", "ios", "clawvibe", "voice"]
+};
+
+// shared/version.ts
+var VERSION = plugin_default.version ?? "0.0.0";
 
 // gateway-daemon.ts
 var startedAt = Date.now();
@@ -746,7 +756,7 @@ function handleConnect(ws, req) {
     payload: {
       type: "hello_ok",
       protocol: 3,
-      server: { name: "clawvibe", version: "0.1.7" },
+      server: { name: "clawvibe", version: VERSION },
       features: {},
       snapshot: {
         presence: [],
@@ -978,7 +988,7 @@ function startHttpServer() {
     fetch(req, server) {
       const url = new URL(req.url);
       if ((url.pathname === "/" || url.pathname === "/health") && !req.headers.get("upgrade")) {
-        return Response.json({ ok: true, server: "clawvibe", version: "0.1.7" });
+        return Response.json({ ok: true, server: "clawvibe", version: VERSION });
       }
       if (url.pathname === "/agents" && req.method === "GET") {
         reprobeUnconfirmed();
