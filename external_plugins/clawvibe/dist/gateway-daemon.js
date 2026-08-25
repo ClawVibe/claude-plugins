@@ -298,7 +298,7 @@ async function pinnedLiveSessions() {
 var plugin_default = {
   name: "clawvibe",
   description: "ClawVibe mobile channel \u2014 pair an iOS device and chat with this Claude Code instance over a secure WebSocket. Includes format directives ([SPEAK]/[TEXT]/---) for TTS-aware clients.",
-  version: "0.1.9",
+  version: "0.1.10",
   keywords: ["channel", "mobile", "ios", "clawvibe", "voice"]
 };
 
