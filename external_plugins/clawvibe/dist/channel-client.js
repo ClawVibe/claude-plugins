@@ -14377,9 +14377,11 @@ function sendIpc(frame) {
 }
 var daemonSpawned = false;
 function spawnDaemon() {
+  const LOG_FILE = join2(STATE_DIR, "daemon.log");
+  const daemonCmd = `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(DAEMON_PATH)} >> ${JSON.stringify(LOG_FILE)} 2>&1`;
   const attempts = [
-    ["setsid", process.execPath, DAEMON_PATH],
-    [process.execPath, DAEMON_PATH]
+    ["setsid", "sh", "-c", daemonCmd],
+    ["sh", "-c", daemonCmd]
   ];
   for (const cmd of attempts) {
     try {

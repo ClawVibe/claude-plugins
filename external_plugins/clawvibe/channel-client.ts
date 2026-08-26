@@ -217,9 +217,14 @@ function spawnDaemon(): void {
   // from this client's process tree. Otherwise the daemon dies/destabilises when
   // the spawning agent session restarts (it is a SHARED, long-lived process).
   // Falls back to a plain detached spawn if `setsid` is unavailable.
+  // Diagnostics: the daemon used to be spawned with stdio all 'ignore', which
+  // sent every routing/broadcast log line to /dev/null and left us blind when
+  // messages went missing. Append both streams to STATE_DIR/daemon.log instead.
+  const LOG_FILE = join(STATE_DIR, 'daemon.log')
+  const daemonCmd = `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(DAEMON_PATH)} >> ${JSON.stringify(LOG_FILE)} 2>&1`
   const attempts: string[][] = [
-    ['setsid', process.execPath, DAEMON_PATH],
-    [process.execPath, DAEMON_PATH],
+    ['setsid', 'sh', '-c', daemonCmd],
+    ['sh', '-c', daemonCmd],
   ]
   for (const cmd of attempts) {
     try {
