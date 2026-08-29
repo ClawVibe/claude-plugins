@@ -11,6 +11,7 @@
     "test:guard": "bun test/reply-guard.ts",
     "test:runs": "bun test/run-keying.ts",
     "test:outbox": "bun test/outbox.ts",
+    "test:history": "bun test/history.ts",
     "test:pins": "bun test/pins.test.ts",
     "test:listing": "bun test/listing.ts",
     "test:reachability": "bun test/reachability.ts",
