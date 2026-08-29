@@ -190,10 +190,17 @@ How it decides:
 - **Channel turns only**, keyed on `origin.kind === "channel"` (`origin.server` names the
   plugin). Intercom-woken and interactive CLI turns have no device waiting and are exempt.
   Liveness probes (`clawvibe:probe:*`) are deliberately **in** scope — they must reply.
-- **Any outbound reply tool counts**, matched by `/^mcp__plugin_.+__(reply|edit_message)$/`
-  — not conversation_id equality. One inbound may legitimately be answered on a different
-  conversation or several, and `edit_message` is a legitimate way to answer. Stricter
-  matching produces false positives. Sidechain (subagent) records never count.
+- **Matching is per-CHANNEL, never per-conversation_id** (`/^mcp__(plugin_.+?)__(reply|edit_message)$/`;
+  group 1 is the MCP server, and `origin.server`'s colons map to underscores). One inbound may
+  legitimately be answered across several conversations on the same channel, and `edit_message`
+  is a legitimate way to answer, so id equality produces false positives. Sidechain (subagent)
+  records never count.
+- **Answering on the WRONG channel is also blocked (#47).** An agent paired to both ClawVibe
+  and Telegram can answer a Telegram message into the app; the guard used to see *a* reply
+  tool and allow it, and the sender still got silence. It now blocks when the **originating**
+  channel got nothing. Fan-out stays legal — replying there *and* elsewhere passes — and an
+  unrecognised `origin.server` stays lenient. This hook catches silence; it does not police
+  fan-out.
 - On a miss it prints `{"decision":"block","reason":...}`, which the host feeds back to the
   model so the turn continues and the agent actually sends.
 
@@ -213,8 +220,9 @@ outbox and ack issues). There is also no way for an agent to declare "this inbou
 reply"; if we ever want that it needs an explicit escape hatch, not a guess by the hook.
 
 Tests: `bun run test:guard` — runs the real hook as a subprocess against synthetic
-transcripts (miss, replied, edit_message, cross-channel, human, intercom, loop, tool_result,
-probe, sidechain, unreadable transcript).
+transcripts (miss, replied, edit_message, wrong-channel, both-channels, telegram origin,
+other-conversation, unknown server, human, intercom, loop, tool_result, probe, sidechain,
+unreadable transcript).
 
 ### Agent idle-stop & waking
 - **Idle-stop**: Claude Code's agent-view supervisor stops an idle, unattended background session after ~1h. When that happens the channel client dies → the agent **deregisters and drops out of the app**. `install-service` (or a Coder `startup_script`) runs `agents up` only at login/boot/workspace-start, so it does **not** counter idle-stop. *(Known gap: a periodic respawn-based heal is not built yet — without it, agents go offline ~1h after their last activity until something re-launches/wakes them.)*
