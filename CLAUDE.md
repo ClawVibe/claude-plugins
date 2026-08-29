@@ -21,7 +21,7 @@ clawvibe-plugin/                    # marketplace repo root
 │   ├── cli.ts                      # automation CLI: setup / agent add|rm|list / agents up|down / install-service
 │   ├── shared/{protocol,access}.ts  # wire+IPC types & sessionKey parser; config+pairing
 │   ├── hooks/{hooks.json,reply-guard.ts}  # Stop hook: block a channel turn that never called `reply`
-│   ├── test/storm-regression.ts    # manual regression check: `bun run test:storm`
+│   ├── test/{storm-regression,run-keying}.ts  # regression checks: `bun run test:storm` / `test:runs`
 │   ├── dist/                       # COMMITTED self-contained bundle (sdk inlined) — what `start`/daemon run
 │   ├── qr.py                       # QR code generator + interactive pairing tool (hits daemon HTTP)
 │   ├── bin/clawvibe                # CLI dispatcher (qr→qr.py; setup/agent/agents/install-service→cli.ts)
@@ -123,6 +123,39 @@ Process lifecycle (split model):
 - **Daemon detaches via `setsid`**: the auto-spawned daemon runs in its own session, independent of the spawning agent (so restarting an agent never destabilises the shared gateway).
 - **Client stdin close → exit**: the per-session `channel-client` (not the daemon) exits when its Claude session ends; it deregisters from the daemon.
 - **Inert without an agent**: a session with the plugin enabled but no `--agent`/`CLAWVIBE_AGENT_ID` does not register (avoids a bogus `default` agent in the picker).
+
+### Run bookkeeping: `activeRuns` is keyed by runId, `runSeq` outlives its run
+
+Both halves of this are load-bearing and were both wrong before #24.
+
+**`activeRuns` is keyed by `runId`, never by `sessionKey`.** Keyed by sessionKey, a second
+`chat.send` on the same conversation overwrote the first entry, and the orphaned run then
+received **no chat event ever** — not `final`, not `error`, and not even the `aborted` safety
+net, because `pruneActiveRuns` can only abort entries still in the map. A client holding
+per-run pending state spins on it forever. A `sessionKey -> Set<runId>` index (`runsBySession`)
+supplies "the newest open run on this conversation" for replies that carry no `runId` and for
+every `edit`, so lookups still work without making the run map itself lossy.
+
+**Superseded runs are deliberately NOT aborted eagerly.** The issue proposed emitting a
+terminal event for a run superseded on the same sessionKey. Once runs are keyed by `runId`
+that is unnecessary and actively harmful: Claude Code folds a second message into the same
+turn, so the earlier run may still legitimately reply. Both runs stay open, and the existing
+TTL prune is the safety net for whichever never finishes.
+
+**`runSeq` is NOT deleted on a terminal state.** It used to be, which reset the counter, so a
+second reply in the same run went out as `seq: 0` again — protocol-invalid duplicate sequence
+numbers, and any client deduping on `(runId, seq)` silently discarded the second and later
+bubbles. Entries now carry a timestamp and expire on the same TTL as runs, which also stops
+the map growing without bound. **This is a prerequisite for the per-device outbox (#23)**,
+which is only safe if the client can dedupe replays on `(runId, seq)`.
+
+`ACTIVE_RUN_TTL_MS` and `TICK_INTERVAL_MS` are env-overridable (`CLAWVIBE_ACTIVE_RUN_TTL_MS`,
+`CLAWVIBE_TICK_INTERVAL_MS`) purely so the regression can watch the abort net fire in seconds
+instead of five minutes. Production never sets them.
+
+Tests: `bun run test:runs` — drives a real daemon + client over the real wire. Verified to
+**fail on main** (duplicate `seq: [0,0]`, and the superseded run missing from the aborted set)
+and pass on the fix.
 
 ### Keeping agents alive #1: NEVER LET THE AGENT SETTLE
 

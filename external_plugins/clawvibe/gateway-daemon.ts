@@ -258,7 +258,9 @@ function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
       // the sessionKey already names its device — so a missing run is no
       // longer a reason to discard the message. It used to be, silently,
       // while the fire-and-forget reply told the agent "sent".
-      const run = activeRuns.get(frame.sessionKey)
+      // Prefer the run the agent is actually answering; fall back to the newest
+      // open run on the conversation for replies that carry no runId.
+      const run = (frame.runId ? activeRuns.get(frame.runId) : undefined) ?? currentRun(frame.sessionKey)
       const targetDeviceId = run?.deviceId ?? deviceIdFromSessionKey(frame.sessionKey) ?? undefined
       if (!targetDeviceId) {
         // Not falling back to every connected device: the key names its
@@ -278,7 +280,7 @@ function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
     case 'edit': {
       // Same reasoning as `reply`: an edit to an unprompted message has no run
       // either, and dropping it would strand the message it edits (#29).
-      const run = activeRuns.get(frame.sessionKey)
+      const run = currentRun(frame.sessionKey)
       const targetDeviceId = run?.deviceId ?? deviceIdFromSessionKey(frame.sessionKey) ?? undefined
       if (!targetDeviceId) return
       broadcastChatEvent(frame.messageId, frame.sessionKey, 'final', {
@@ -319,18 +321,57 @@ const ipcServer = Bun.listen<SockState>({
 
 const clients = new Map<string, Set<ServerWebSocket<WSData>>>()
 const handshakeTimers = new Map<ServerWebSocket<WSData>, Timer>()
-// keyed by sessionKey; deviceId lets replies route back to the originating device
-const activeRuns = new Map<string, { runId: string; ts: number; deviceId: string }>()
-const runSeq = new Map<string, number>() // per-run chat event sequence
+// Keyed by runId, NOT sessionKey (#24). Keying by sessionKey meant a second
+// chat.send on the same conversation overwrote the first entry, and the orphaned
+// run then received no chat event ever — not final, not error, and not even the
+// aborted safety net, because pruneActiveRuns can only abort entries still in
+// the map. deviceId lets replies route back to the originating device.
+const activeRuns = new Map<string, { runId: string; sessionKey: string; ts: number; deviceId: string }>()
+// sessionKey -> runIds in start order. Lets a reply that carries no runId (and
+// every `edit`) resolve "the current run on this conversation" without making
+// the run map itself lossy.
+const runsBySession = new Map<string, Set<string>>()
+// Per-run chat event sequence. Deliberately NOT deleted on a terminal state
+// (#24): doing so reset the counter, so a second reply in the same run was
+// emitted as seq 0 again and any client deduping on (runId, seq) silently
+// discarded it. Expired on TTL instead, which also stops the map growing.
+const runSeq = new Map<string, { n: number; ts: number }>()
 
 let msgSeq = 0
 let eventSeq = 0
 function nextMsgId(): string { return `m${Date.now()}-${++msgSeq}` }
 function nextEventSeq(): number { return ++eventSeq }
 function nextRunSeq(runId: string): number {
-  const n = (runSeq.get(runId) ?? -1) + 1
-  runSeq.set(runId, n)
+  const n = (runSeq.get(runId)?.n ?? -1) + 1
+  runSeq.set(runId, { n, ts: Date.now() })
   return n
+}
+
+function startRun(sessionKey: string, runId: string, deviceId: string): void {
+  activeRuns.set(runId, { runId, sessionKey, ts: Date.now(), deviceId })
+  let set = runsBySession.get(sessionKey)
+  if (!set) { set = new Set(); runsBySession.set(sessionKey, set) }
+  set.add(runId)
+}
+
+/** The most recently started run still open on this conversation, if any. */
+function currentRun(sessionKey: string) {
+  const set = runsBySession.get(sessionKey)
+  if (!set) return undefined
+  let latest: { runId: string; sessionKey: string; ts: number; deviceId: string } | undefined
+  for (const id of set) {
+    const run = activeRuns.get(id)
+    if (run && (!latest || run.ts >= latest.ts)) latest = run
+  }
+  return latest
+}
+
+function endRun(runId: string): void {
+  const run = activeRuns.get(runId)
+  if (!run) return
+  activeRuns.delete(runId)
+  const set = runsBySession.get(run.sessionKey)
+  if (set) { set.delete(runId); if (set.size === 0) runsBySession.delete(run.sessionKey) }
 }
 
 function reapDeadSockets(): void {
@@ -344,13 +385,17 @@ function reapDeadSockets(): void {
 
 function pruneActiveRuns(): void {
   const now = Date.now()
-  for (const [k, v] of activeRuns) {
-    if (now - v.ts > ACTIVE_RUN_TTL_MS) {
-      activeRuns.delete(k)
-      runSeq.delete(v.runId)
+  for (const run of [...activeRuns.values()]) {
+    if (now - run.ts > ACTIVE_RUN_TTL_MS) {
       // Don't leave the app spinning on a run that never produced a final.
-      broadcastChatEvent(v.runId, k, 'aborted', { targetDeviceId: v.deviceId })
+      // broadcastChatEvent ends the run for us (terminal state).
+      broadcastChatEvent(run.runId, run.sessionKey, 'aborted', { targetDeviceId: run.deviceId })
     }
+  }
+  // Sequence counters outlive their run so a late reply keeps counting up
+  // instead of restarting at 0; they expire on the same TTL.
+  for (const [runId, v] of runSeq) {
+    if (now - v.ts > ACTIVE_RUN_TTL_MS) runSeq.delete(runId)
   }
 }
 
@@ -400,7 +445,9 @@ function broadcastChatEvent(
     }
   }
   if (opts.errorMessage !== undefined) payload.errorMessage = opts.errorMessage
-  if (state === 'final' || state === 'error' || state === 'aborted') runSeq.delete(runId)
+  // Close the run, but keep its sequence counter (see runSeq above): a further
+  // reply on this runId must continue the sequence, not restart it.
+  if (state === 'final' || state === 'error' || state === 'aborted') endRun(runId)
 
   broadcastEvent({
     type: 'event',
@@ -582,7 +629,7 @@ function handleChatSend(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
 
   const runId = nextMsgId()
   const deviceId = ws.data.device_id
-  activeRuns.set(sessionKey, { runId, ts: Date.now(), deviceId })
+  startRun(sessionKey, runId, deviceId)
 
   const { context, location, voiceData } = parseSensoryTags(message)
   process.stderr.write(`clawvibe-daemon: chat.send runId=${runId} session=${sessionKey} text="${message.slice(0, 80)}"\n`)
@@ -760,7 +807,7 @@ function handleLegacyFrame(ws: ServerWebSocket<WSData>, frame: LegacyInFrame): v
       const runId = frame.run_id
       // Legacy frames have no agent in the key — route via fallback.
       const sessionKey = frame.conversation_id || `device:${ws.data.device_id}`
-      activeRuns.set(sessionKey, { runId, ts: Date.now(), deviceId: ws.data.device_id })
+      startRun(sessionKey, runId, ws.data.device_id)
       routeInbound(sessionKey, runId, parts.join('\n'), {
         device_id: ws.data.device_id,
         device_name: ws.data.device_name,

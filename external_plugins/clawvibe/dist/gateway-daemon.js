@@ -61,9 +61,9 @@ var PID_FILE = join(STATE_DIR, "server.pid");
 var SOCK_FILE = join(STATE_DIR, "gateway.sock");
 var PORT = Number(process.env.CLAWVIBE_PORT ?? 8791);
 var HOSTNAME = process.env.CLAWVIBE_HOSTNAME ?? "127.0.0.1";
-var TICK_INTERVAL_MS = 30000;
+var TICK_INTERVAL_MS = Number(process.env.CLAWVIBE_TICK_INTERVAL_MS) || 30000;
 var HANDSHAKE_TIMEOUT_MS = 1e4;
-var ACTIVE_RUN_TTL_MS = 5 * 60 * 1000;
+var ACTIVE_RUN_TTL_MS = Number(process.env.CLAWVIBE_ACTIVE_RUN_TTL_MS) || 5 * 60 * 1000;
 function ensureStateDirs() {
   mkdirSync(STATE_DIR, { recursive: true, mode: 448 });
   mkdirSync(APPROVED_DIR, { recursive: true, mode: 448 });
@@ -469,7 +469,7 @@ function handleIpcFrame(sock, frame) {
       }
       if (frame.sessionKey.startsWith("clawvibe:probe"))
         return;
-      const run = activeRuns.get(frame.sessionKey);
+      const run = (frame.runId ? activeRuns.get(frame.runId) : undefined) ?? currentRun(frame.sessionKey);
       const targetDeviceId = run?.deviceId ?? deviceIdFromSessionKey(frame.sessionKey) ?? undefined;
       if (!targetDeviceId) {
         process.stderr.write(`clawvibe-daemon: reply dropped, no device in session ${frame.sessionKey}
@@ -484,7 +484,7 @@ function handleIpcFrame(sock, frame) {
       return;
     }
     case "edit": {
-      const run = activeRuns.get(frame.sessionKey);
+      const run = currentRun(frame.sessionKey);
       const targetDeviceId = run?.deviceId ?? deviceIdFromSessionKey(frame.sessionKey) ?? undefined;
       if (!targetDeviceId)
         return;
@@ -528,6 +528,7 @@ var ipcServer = Bun.listen({
 var clients = new Map;
 var handshakeTimers = new Map;
 var activeRuns = new Map;
+var runsBySession = new Map;
 var runSeq = new Map;
 var msgSeq = 0;
 var eventSeq = 0;
@@ -538,9 +539,42 @@ function nextEventSeq() {
   return ++eventSeq;
 }
 function nextRunSeq(runId) {
-  const n = (runSeq.get(runId) ?? -1) + 1;
-  runSeq.set(runId, n);
+  const n = (runSeq.get(runId)?.n ?? -1) + 1;
+  runSeq.set(runId, { n, ts: Date.now() });
   return n;
+}
+function startRun(sessionKey, runId, deviceId) {
+  activeRuns.set(runId, { runId, sessionKey, ts: Date.now(), deviceId });
+  let set = runsBySession.get(sessionKey);
+  if (!set) {
+    set = new Set;
+    runsBySession.set(sessionKey, set);
+  }
+  set.add(runId);
+}
+function currentRun(sessionKey) {
+  const set = runsBySession.get(sessionKey);
+  if (!set)
+    return;
+  let latest;
+  for (const id of set) {
+    const run = activeRuns.get(id);
+    if (run && (!latest || run.ts >= latest.ts))
+      latest = run;
+  }
+  return latest;
+}
+function endRun(runId) {
+  const run = activeRuns.get(runId);
+  if (!run)
+    return;
+  activeRuns.delete(runId);
+  const set = runsBySession.get(run.sessionKey);
+  if (set) {
+    set.delete(runId);
+    if (set.size === 0)
+      runsBySession.delete(run.sessionKey);
+  }
 }
 function reapDeadSockets() {
   let reaped = 0;
@@ -559,12 +593,14 @@ function reapDeadSockets() {
 }
 function pruneActiveRuns() {
   const now = Date.now();
-  for (const [k, v] of activeRuns) {
-    if (now - v.ts > ACTIVE_RUN_TTL_MS) {
-      activeRuns.delete(k);
-      runSeq.delete(v.runId);
-      broadcastChatEvent(v.runId, k, "aborted", { targetDeviceId: v.deviceId });
+  for (const run of [...activeRuns.values()]) {
+    if (now - run.ts > ACTIVE_RUN_TTL_MS) {
+      broadcastChatEvent(run.runId, run.sessionKey, "aborted", { targetDeviceId: run.deviceId });
     }
+  }
+  for (const [runId, v] of runSeq) {
+    if (now - v.ts > ACTIVE_RUN_TTL_MS)
+      runSeq.delete(runId);
   }
 }
 function sendFrame(ws, frame) {
@@ -625,7 +661,7 @@ function broadcastChatEvent(runId, sessionKey, state, opts = {}) {
   if (opts.errorMessage !== undefined)
     payload.errorMessage = opts.errorMessage;
   if (state === "final" || state === "error" || state === "aborted")
-    runSeq.delete(runId);
+    endRun(runId);
   broadcastEvent({
     type: "event",
     event: "chat",
@@ -808,7 +844,7 @@ function handleChatSend(ws, req) {
   const timeoutMs = typeof params.timeoutMs === "number" ? params.timeoutMs : undefined;
   const runId = nextMsgId();
   const deviceId = ws.data.device_id;
-  activeRuns.set(sessionKey, { runId, ts: Date.now(), deviceId });
+  startRun(sessionKey, runId, deviceId);
   const { context, location, voiceData } = parseSensoryTags(message);
   process.stderr.write(`clawvibe-daemon: chat.send runId=${runId} session=${sessionKey} text="${message.slice(0, 80)}"
 `);
@@ -966,7 +1002,7 @@ function handleLegacyFrame(ws, frame) {
         parts.push(`[VOICE_DATA: ${JSON.stringify(frame.tags.voice_data)}]`);
       const runId = frame.run_id;
       const sessionKey = frame.conversation_id || `device:${ws.data.device_id}`;
-      activeRuns.set(sessionKey, { runId, ts: Date.now(), deviceId: ws.data.device_id });
+      startRun(sessionKey, runId, ws.data.device_id);
       routeInbound(sessionKey, runId, parts.join(`
 `), {
         device_id: ws.data.device_id,

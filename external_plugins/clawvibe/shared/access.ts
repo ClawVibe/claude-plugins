@@ -19,9 +19,11 @@ export const PID_FILE = join(STATE_DIR, 'server.pid')
 export const SOCK_FILE = join(STATE_DIR, 'gateway.sock')
 export const PORT = Number(process.env.CLAWVIBE_PORT ?? 8791)
 export const HOSTNAME = process.env.CLAWVIBE_HOSTNAME ?? '127.0.0.1'
-export const TICK_INTERVAL_MS = 30_000
+// Overridable so the run-bookkeeping regression (#24) can watch the abort
+// safety net fire without waiting five minutes. Production never sets these.
+export const TICK_INTERVAL_MS = Number(process.env.CLAWVIBE_TICK_INTERVAL_MS) || 30_000
 export const HANDSHAKE_TIMEOUT_MS = 10_000
-export const ACTIVE_RUN_TTL_MS = 5 * 60 * 1000
+export const ACTIVE_RUN_TTL_MS = Number(process.env.CLAWVIBE_ACTIVE_RUN_TTL_MS) || 5 * 60 * 1000
 
 export function ensureStateDirs(): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })

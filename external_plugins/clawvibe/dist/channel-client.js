@@ -14082,9 +14082,9 @@ var PID_FILE = join(STATE_DIR, "server.pid");
 var SOCK_FILE = join(STATE_DIR, "gateway.sock");
 var PORT = Number(process.env.CLAWVIBE_PORT ?? 8791);
 var HOSTNAME = process.env.CLAWVIBE_HOSTNAME ?? "127.0.0.1";
-var TICK_INTERVAL_MS = 30000;
+var TICK_INTERVAL_MS = Number(process.env.CLAWVIBE_TICK_INTERVAL_MS) || 30000;
 var HANDSHAKE_TIMEOUT_MS = 1e4;
-var ACTIVE_RUN_TTL_MS = 5 * 60 * 1000;
+var ACTIVE_RUN_TTL_MS = Number(process.env.CLAWVIBE_ACTIVE_RUN_TTL_MS) || 5 * 60 * 1000;
 function ensureStateDirs() {
   mkdirSync(STATE_DIR, { recursive: true, mode: 448 });
   mkdirSync(APPROVED_DIR, { recursive: true, mode: 448 });
