@@ -1,11 +1,17 @@
 #!/usr/bin/env bun
 /**
- * Stop hook: fail a channel turn that never called the reply tool (issue #39).
+ * Stop hook: fail a channel turn that did not answer on its channel (#39, #47).
  *
  * An agent can write a perfect answer into its transcript and never call
  * `mcp__plugin_clawvibe_clawvibe__reply` / `mcp__plugin_telegram_telegram__reply`.
  * The device gets silence and the agent believes it answered. Prompt discipline
  * has not held, so this is the mechanical backstop.
+ *
+ * Two ways to leave someone in silence, and both are caught (#47):
+ *   1. no reply tool called at all,
+ *   2. a reply called, but only on a DIFFERENT channel than the one that asked
+ *      — an agent paired to both ClawVibe and Telegram answering a Telegram
+ *      message into the app.
  *
  * Contract: reads the Stop hook payload on stdin, and on a miss prints
  * `{"decision":"block","reason":...}` on stdout, which Claude Code feeds back to
@@ -23,8 +29,19 @@ const LOG_FILE = join(STATE_DIR, 'reply-guard.log')
 
 /** Outbound channel tools. `edit_message` counts: editing a message the agent
  *  already sent is a legitimate way to answer. Deliberately matches ANY channel
- *  plugin, not just clawvibe/telegram. */
-const REPLY_TOOL = /^mcp__plugin_.+__(reply|edit_message)$/
+ *  plugin, not just clawvibe/telegram — capture group 1 is the MCP server. */
+const REPLY_TOOL = /^mcp__(plugin_.+?)__(reply|edit_message)$/
+
+/**
+ * The MCP server name a reply tool belongs to, in the form the transcript's
+ * `origin.server` uses: `plugin:clawvibe:clawvibe` <-> `plugin_clawvibe_clawvibe`.
+ * Tool names cannot contain `:`, so the mapping is a straight substitution.
+ */
+function serverOfTool(name: string): string | undefined {
+  const m = REPLY_TOOL.exec(name)
+  return m ? m[1] : undefined
+}
+const serverToToolPrefix = (server: string) => server.replace(/:/g, '_')
 
 function log(line: string): void {
   try {
@@ -36,6 +53,12 @@ function log(line: string): void {
 }
 
 function allow(): never {
+  process.exit(0)
+}
+
+/** Ask Claude Code to feed `reason` back to the model so the turn continues. */
+function block(reason: string): never {
+  process.stdout.write(JSON.stringify({ decision: 'block', reason }) + '\n')
   process.exit(0)
 }
 
@@ -115,32 +138,52 @@ function main(raw: string): void {
     '(unknown)'
   const server = prompt.origin?.server ?? '(unknown server)'
 
-  // Match on "any outbound reply tool fired", NOT on conversation_id equality.
-  // One inbound can legitimately produce replies on a different conversation, or
-  // several; stricter matching produces false positives.
+  // Collect every outbound reply, and which channel it went out on. Matching is
+  // per-SERVER, never on conversation_id: one inbound can legitimately fan out
+  // across several conversations on the same channel, and equality there would
+  // produce false positives.
+  const repliedServers = new Set<string>()
   for (let i = promptIdx + 1; i < recs.length; i++) {
     const r = recs[i]
     if (r.type !== 'assistant' || r.isSidechain) continue
     const blocks = r.message?.content
     if (!Array.isArray(blocks)) continue
     for (const b of blocks) {
-      if (b && typeof b === 'object' && b.type === 'tool_use' && REPLY_TOOL.test(String(b.name))) {
-        return allow()
+      if (b && typeof b === 'object' && b.type === 'tool_use') {
+        const s = serverOfTool(String(b.name))
+        if (s) repliedServers.add(s)
       }
     }
   }
 
-  log(`blocked: no reply tool called for ${server} ${target}`)
-  process.stdout.write(
-    JSON.stringify({
-      decision: 'block',
-      reason:
-        `You ended your turn without calling the channel reply tool, so the user received NOTHING. ` +
-        `Text in your transcript is not delivered — only the reply tool sends. ` +
-        `Send your answer now for ${server}, target "${target}", then end your turn standing by.`,
-    }) + '\n',
-  )
-  process.exit(0)
+  if (repliedServers.size === 0) {
+    log(`blocked: no reply tool called for ${server} ${target}`)
+    return block(
+      `You ended your turn without calling the channel reply tool, so the user received NOTHING. ` +
+      `Text in your transcript is not delivered — only the reply tool sends. ` +
+      `Send your answer now for ${server}, target "${target}", then end your turn standing by.`,
+    )
+  }
+
+  // #47: replying on the WRONG channel is the same silence, one level in — an
+  // agent paired to both ClawVibe and Telegram can answer a Telegram message
+  // into the ClawVibe app, and the sender still gets nothing.
+  //
+  // Only fires when the originating channel got NOTHING. Answering here AND
+  // pinging elsewhere stays legal, and an unrecognised origin stays lenient:
+  // this hook exists to catch silence, not to police fan-out.
+  const wanted = prompt.origin?.server ? serverToToolPrefix(prompt.origin.server) : undefined
+  if (wanted && !repliedServers.has(wanted)) {
+    log(`blocked: replied on [${[...repliedServers].join(',')}] but not on originating ${server} ${target}`)
+    return block(
+      `You replied, but NOT on the channel the message came from, so the person who asked received nothing. ` +
+      `The message arrived on ${server} (target "${target}"); your reply went to ` +
+      `${[...repliedServers].map(s => s.replace(/_/g, ':')).join(', ')}. ` +
+      `Send your answer on ${server} now, then end your turn standing by.`,
+    )
+  }
+
+  return allow()
 }
 
 readStdin().then(main).catch(allow)

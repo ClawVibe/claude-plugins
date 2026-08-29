@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Regression check for the Stop reply-guard hook (issue #39).
+ * Regression check for the Stop reply-guard hook (issues #39, #47).
  *
  * Builds synthetic transcripts, runs the real hook as a subprocess with a real
  * Stop payload on stdin, and asserts on its stdout. Run: `bun run test:guard`.
@@ -65,12 +65,52 @@ console.log('reply-guard')
   check('allows a channel turn that replied', r.out === '', r.out)
 }
 {
-  const r = await run('edited', [channelPrompt('clawvibe:abc'), toolUse('mcp__plugin_telegram_telegram__edit_message')])
+  const r = await run('edited', [channelPrompt('clawvibe:abc'), toolUse('mcp__plugin_clawvibe_clawvibe__edit_message')])
   check('edit_message counts as answering', r.out === '', r.out)
 }
 {
+  // #47: answering somewhere else is the same silence for the person who asked.
   const r = await run('crosschannel', [channelPrompt('clawvibe:abc'), toolUse('mcp__plugin_telegram_telegram__reply')])
-  check('any outbound reply tool counts (no conversation_id equality)', r.out === '', r.out)
+  const parsed = r.out ? JSON.parse(r.out) : null
+  check('blocks a reply sent on a different channel than the prompt', parsed?.decision === 'block', r.out)
+  check('reason names the originating channel',
+    String(parsed?.reason ?? '').includes('plugin:clawvibe:clawvibe'), parsed?.reason)
+  check('reason names where the reply actually went',
+    String(parsed?.reason ?? '').includes('plugin:telegram:telegram'), parsed?.reason)
+}
+{
+  // Fan-out stays legal: the guard catches silence, it does not police extras.
+  const r = await run('bothchannels', [
+    channelPrompt('clawvibe:abc'),
+    toolUse('mcp__plugin_telegram_telegram__reply'),
+    toolUse('mcp__plugin_clawvibe_clawvibe__reply'),
+  ])
+  check('replying on the originating channel AND elsewhere is allowed', r.out === '', r.out)
+}
+{
+  const r = await run('telegramorigin', [
+    channelPrompt('8263946533', 'plugin:telegram:telegram'),
+    toolUse('mcp__plugin_telegram_telegram__reply'),
+  ])
+  check('a telegram turn answered on telegram is allowed', r.out === '', r.out)
+}
+{
+  // No conversation_id equality: one inbound may fan out across conversations
+  // on the SAME channel, and matching on the id would fail that.
+  const r = await run('otherconv', [
+    channelPrompt('clawvibe:abc'),
+    toolUse('mcp__plugin_clawvibe_clawvibe__reply'),
+  ])
+  check('matching is per-channel, not per-conversation_id', r.out === '', r.out)
+}
+{
+  // Lenient when the origin server is unknown: catch silence, do not invent it.
+  const noServer = {
+    type: 'user', isSidechain: false, origin: { kind: 'channel' },
+    message: { role: 'user', content: '<channel chat_id="x">hi</channel>' },
+  }
+  const r = await run('noserver', [noServer, toolUse('mcp__plugin_telegram_telegram__reply')])
+  check('an unrecognised origin server stays lenient', r.out === '', r.out)
 }
 {
   const r = await run('human', [humanPrompt, assistantText])
