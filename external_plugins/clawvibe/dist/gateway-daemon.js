@@ -47,7 +47,8 @@ var __export = (target, all) => {
 
 // gateway-daemon.ts
 import { randomBytes as randomBytes2 } from "crypto";
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, rmSync as rmSync2, existsSync, unlinkSync } from "fs";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, rmSync as rmSync2, existsSync, unlinkSync, readdirSync as readdirSync2, renameSync } from "fs";
+import { join as join3 } from "path";
 
 // shared/access.ts
 import { randomBytes } from "crypto";
@@ -57,6 +58,7 @@ import { join } from "path";
 var STATE_DIR = process.env.CLAWVIBE_STATE_DIR ?? join(homedir(), ".claude", "channels", "clawvibe");
 var ACCESS_FILE = join(STATE_DIR, "access.json");
 var APPROVED_DIR = join(STATE_DIR, "approved");
+var PENDING_DIR = join(STATE_DIR, "pending");
 var PID_FILE = join(STATE_DIR, "server.pid");
 var SOCK_FILE = join(STATE_DIR, "gateway.sock");
 var PORT = Number(process.env.CLAWVIBE_PORT ?? 8791);
@@ -64,9 +66,17 @@ var HOSTNAME = process.env.CLAWVIBE_HOSTNAME ?? "127.0.0.1";
 var TICK_INTERVAL_MS = Number(process.env.CLAWVIBE_TICK_INTERVAL_MS) || 30000;
 var HANDSHAKE_TIMEOUT_MS = 1e4;
 var ACTIVE_RUN_TTL_MS = Number(process.env.CLAWVIBE_ACTIVE_RUN_TTL_MS) || 5 * 60 * 1000;
+var OUTBOX_TTL_MS = Number(process.env.CLAWVIBE_OUTBOX_TTL_MS) || 5 * 60 * 1000;
+var OUTBOX_MAX = Number(process.env.CLAWVIBE_OUTBOX_MAX) || 200;
+var HISTORY_TTL_MS = Number(process.env.CLAWVIBE_HISTORY_TTL_MS) || 60 * 60 * 1000;
+var HISTORY_MAX = Number(process.env.CLAWVIBE_HISTORY_MAX) || 100;
+var HISTORY_DEFAULT_LIMIT = 20;
+var HISTORY_DEFAULT_MAX_CHARS = 20000;
+var OUTBOX_PERSIST_DEBOUNCE_MS = Number(process.env.CLAWVIBE_OUTBOX_PERSIST_DEBOUNCE_MS) || 1000;
 function ensureStateDirs() {
   mkdirSync(STATE_DIR, { recursive: true, mode: 448 });
   mkdirSync(APPROVED_DIR, { recursive: true, mode: 448 });
+  mkdirSync(PENDING_DIR, { recursive: true, mode: 448 });
 }
 function defaultAccess() {
   return { dmPolicy: "pairing", approved: {}, pending: {} };
@@ -527,6 +537,9 @@ var ipcServer = Bun.listen({
 });
 var clients = new Map;
 var handshakeTimers = new Map;
+var outbox = new Map;
+var lastPong = new WeakMap;
+var history = new Map;
 var activeRuns = new Map;
 var runsBySession = new Map;
 var runSeq = new Map;
@@ -574,6 +587,198 @@ function endRun(runId) {
     set.delete(runId);
     if (set.size === 0)
       runsBySession.delete(run.sessionKey);
+  }
+}
+function outboxFile(deviceId) {
+  return join3(PENDING_DIR, `${encodeURIComponent(deviceId)}.jsonl`);
+}
+var outboxDirty = new Set;
+var outboxPersistTimer;
+function markOutboxDirty(deviceId) {
+  outboxDirty.add(deviceId);
+  if (outboxPersistTimer)
+    return;
+  outboxPersistTimer = setTimeout(() => {
+    outboxPersistTimer = undefined;
+    persistOutbox();
+  }, OUTBOX_PERSIST_DEBOUNCE_MS);
+}
+function persistOutbox() {
+  for (const deviceId of outboxDirty) {
+    const file = outboxFile(deviceId);
+    const q = outbox.get(deviceId);
+    try {
+      if (!q || q.length === 0) {
+        if (existsSync(file))
+          unlinkSync(file);
+      } else {
+        const tmp = `${file}.tmp`;
+        writeFileSync2(tmp, q.map((e) => JSON.stringify(e)).join(`
+`) + `
+`, { mode: 384 });
+        renameSync(tmp, file);
+      }
+    } catch (err) {
+      process.stderr.write(`clawvibe-daemon: outbox persist failed device=${deviceId}: ${err}
+`);
+    }
+  }
+  outboxDirty.clear();
+}
+function loadOutbox(approved) {
+  const known = new Set(Object.keys(approved));
+  const now = Date.now();
+  let files = 0, restored = 0, swept = 0;
+  let names = [];
+  try {
+    names = readdirSync2(PENDING_DIR);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const file = join3(PENDING_DIR, name);
+    if (name.endsWith(".tmp")) {
+      try {
+        unlinkSync(file);
+      } catch {}
+      continue;
+    }
+    if (!name.endsWith(".jsonl"))
+      continue;
+    let deviceId;
+    try {
+      deviceId = decodeURIComponent(name.slice(0, -".jsonl".length));
+    } catch {
+      continue;
+    }
+    if (!known.has(deviceId)) {
+      try {
+        unlinkSync(file);
+      } catch {}
+      swept++;
+      continue;
+    }
+    files++;
+    const q = [];
+    let text = "";
+    try {
+      text = readFileSync2(file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split(`
+`)) {
+      if (!line.trim())
+        continue;
+      try {
+        const entry = JSON.parse(line);
+        if (typeof entry.payload !== "string" || typeof entry.ts !== "number")
+          continue;
+        if (now - entry.ts > OUTBOX_TTL_MS)
+          continue;
+        q.push({ payload: entry.payload, ts: entry.ts });
+      } catch {}
+    }
+    while (q.length > OUTBOX_MAX)
+      q.shift();
+    if (q.length === 0) {
+      try {
+        unlinkSync(file);
+      } catch {}
+      continue;
+    }
+    outbox.set(deviceId, q);
+    restored += q.length;
+  }
+  if (files || swept) {
+    process.stderr.write(`clawvibe-daemon: outbox restored ${restored} event(s) for ${files} device(s), swept ${swept} unknown device file(s)
+`);
+  }
+}
+function enqueueOutbox(deviceId, payload) {
+  const q = outbox.get(deviceId) ?? [];
+  q.push({ payload, ts: Date.now() });
+  while (q.length > OUTBOX_MAX)
+    q.shift();
+  outbox.set(deviceId, q);
+  markOutboxDirty(deviceId);
+}
+function recordHistory(sessionKey, runId, seq, text) {
+  const q = history.get(sessionKey) ?? [];
+  q.push({ runId, seq, text, ts: Date.now() });
+  while (q.length > HISTORY_MAX)
+    q.shift();
+  history.set(sessionKey, q);
+}
+function pruneHistory() {
+  const now = Date.now();
+  for (const [sessionKey, q] of history) {
+    const kept = q.filter((e) => now - e.ts <= HISTORY_TTL_MS);
+    if (kept.length === 0)
+      history.delete(sessionKey);
+    else if (kept.length !== q.length)
+      history.set(sessionKey, kept);
+  }
+}
+function pruneOutbox() {
+  const now = Date.now();
+  for (const [deviceId, q] of outbox) {
+    const kept = q.filter((e) => now - e.ts <= OUTBOX_TTL_MS);
+    if (kept.length === q.length)
+      continue;
+    if (kept.length === 0)
+      outbox.delete(deviceId);
+    else
+      outbox.set(deviceId, kept);
+    markOutboxDirty(deviceId);
+  }
+}
+function flushOutbox(ws, deviceId) {
+  const q = outbox.get(deviceId);
+  if (!q || q.length === 0)
+    return;
+  outbox.delete(deviceId);
+  markOutboxDirty(deviceId);
+  const now = Date.now();
+  let replayed = 0;
+  for (const entry of q) {
+    if (now - entry.ts > OUTBOX_TTL_MS)
+      continue;
+    try {
+      if (ws.readyState === 1) {
+        ws.send(entry.payload);
+        replayed++;
+      }
+    } catch (err) {
+      process.stderr.write(`clawvibe-daemon: outbox replay failed: ${err}
+`);
+    }
+  }
+  process.stderr.write(`clawvibe-daemon: outbox replayed ${replayed}/${q.length} event(s) to device=${deviceId}
+`);
+}
+function pingDeviceSockets() {
+  const now = Date.now();
+  const deadline = TICK_INTERVAL_MS * 2.5;
+  for (const set of clients.values()) {
+    for (const ws of set) {
+      if (ws.readyState !== 1)
+        continue;
+      const seen = lastPong.get(ws);
+      if (seen !== undefined && now - seen > deadline) {
+        process.stderr.write(`clawvibe-daemon: no pong in ${Math.round((now - seen) / 1000)}s, closing device=${ws.data.device_id}
+`);
+        try {
+          ws.close(4002, "no pong");
+        } catch {}
+        continue;
+      }
+      if (seen === undefined)
+        lastPong.set(ws, now);
+      try {
+        ws.ping();
+      } catch {}
+    }
   }
 }
 function reapDeadSockets() {
@@ -639,8 +844,11 @@ function broadcastEvent(frame, targetDeviceId) {
   else
     for (const set of clients.values())
       set.forEach(send);
+  if (targetDeviceId && sent === 0 && frame.event === "chat") {
+    enqueueOutbox(targetDeviceId, payload);
+  }
   if (frame.event !== "tick") {
-    process.stderr.write(`clawvibe-daemon: broadcast event=${frame.event} sent=${sent} skipped=${skipped}
+    process.stderr.write(`clawvibe-daemon: broadcast event=${frame.event} sent=${sent} skipped=${skipped}` + (targetDeviceId && sent === 0 && frame.event === "chat" ? ` queued=${outbox.get(targetDeviceId)?.length ?? 0}` : "") + `
 `);
   }
 }
@@ -651,12 +859,15 @@ function broadcastChatEvent(runId, sessionKey, state, opts = {}) {
     seq: nextRunSeq(runId),
     state
   };
+  const seq = payload.seq;
   if (opts.text !== undefined) {
     payload.message = {
       role: "assistant",
       content: [{ type: "text", text: opts.text }],
       timestamp: new Date().toISOString()
     };
+    if (state === "final")
+      recordHistory(sessionKey, runId, seq, opts.text);
   }
   if (opts.errorMessage !== undefined)
     payload.errorMessage = opts.errorMessage;
@@ -671,8 +882,11 @@ function broadcastChatEvent(runId, sessionKey, state, opts = {}) {
   }, opts.targetDeviceId);
 }
 setInterval(() => {
+  pingDeviceSockets();
   reapDeadSockets();
   pruneActiveRuns();
+  pruneOutbox();
+  pruneHistory();
   refreshPinnedSnapshot();
   broadcastEvent({ type: "event", event: "tick", payload: null, seq: nextEventSeq(), stateVersion: null });
 }, TICK_INTERVAL_MS);
@@ -819,6 +1033,54 @@ function handleConnect(ws, req) {
   });
   process.stderr.write(`clawvibe-daemon: device authenticated id=${device.device_id} name="${device.device_name}"
 `);
+  flushOutbox(ws, device.device_id);
+}
+function handleChatHistory(ws, req) {
+  const params = req.params ?? {};
+  const sessionKey = params.sessionKey;
+  if (typeof sessionKey !== "string" || !sessionKey) {
+    sendFrame(ws, { type: "res", id: req.id, ok: false, error: { message: "sessionKey required" } });
+    return;
+  }
+  const owner = deviceIdFromSessionKey(sessionKey);
+  if (owner && owner !== ws.data.device_id) {
+    process.stderr.write(`clawvibe-daemon: chat.history refused, device=${ws.data.device_id} asked for session owned by ${owner}
+`);
+    sendFrame(ws, { type: "res", id: req.id, ok: true, payload: { messages: [] } });
+    return;
+  }
+  const rawLimit = typeof params.limit === "number" ? params.limit : HISTORY_DEFAULT_LIMIT;
+  const limit = Math.max(0, Math.min(Math.floor(rawLimit), HISTORY_MAX));
+  const rawMaxChars = typeof params.maxChars === "number" ? params.maxChars : HISTORY_DEFAULT_MAX_CHARS;
+  const maxChars = Math.max(0, Math.floor(rawMaxChars));
+  const now = Date.now();
+  const all = (history.get(sessionKey) ?? []).filter((e) => now - e.ts <= HISTORY_TTL_MS);
+  const picked = [];
+  let chars = 0;
+  for (let i = all.length - 1;i >= 0 && picked.length < limit; i--) {
+    const entry = all[i];
+    if (picked.length > 0 && chars + entry.text.length > maxChars)
+      break;
+    chars += entry.text.length;
+    picked.push(entry);
+  }
+  picked.reverse();
+  process.stderr.write(`clawvibe-daemon: chat.history session=${sessionKey} -> ${picked.length}/${all.length} message(s), ${chars} chars
+`);
+  sendFrame(ws, {
+    type: "res",
+    id: req.id,
+    ok: true,
+    payload: {
+      messages: picked.map((e) => ({
+        role: "assistant",
+        content: [{ type: "text", text: e.text }],
+        timestamp: new Date(e.ts).toISOString(),
+        runId: e.runId,
+        seq: e.seq
+      }))
+    }
+  });
 }
 function parseSensoryTags(message) {
   let context, location, voiceData;
@@ -977,6 +1239,8 @@ function handleRPC(ws, req) {
       return handleAgentsList(ws, req);
     case "agent.identity.get":
       return handleAgentIdentityGet(ws, req);
+    case "chat.history":
+      return handleChatHistory(ws, req);
     default:
       sendFrame(ws, { type: "res", id: req.id, ok: false, error: { message: `unknown method: ${req.method}` } });
   }
@@ -1144,6 +1408,9 @@ function startHttpServer() {
 `);
         }
       },
+      pong(ws) {
+        lastPong.set(ws, Date.now());
+      },
       close(ws, code) {
         const timer = handshakeTimers.get(ws);
         if (timer) {
@@ -1218,6 +1485,7 @@ try {
 writeFileSync2(PID_FILE, String(process.pid));
 process.stderr.write(`clawvibe-daemon: listening on http://${HOSTNAME}:${PORT} (ipc ${SOCK_FILE})
 `);
+loadOutbox(readAccess().approved);
 refreshPinnedSnapshot();
 var shuttingDown = false;
 function shutdown(sig) {
@@ -1226,6 +1494,9 @@ function shutdown(sig) {
   shuttingDown = true;
   process.stderr.write(`clawvibe-daemon: ${sig} \u2014 shutting down
 `);
+  for (const deviceId of outbox.keys())
+    outboxDirty.add(deviceId);
+  persistOutbox();
   try {
     httpServer.stop(true);
   } catch {}
