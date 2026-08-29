@@ -47,7 +47,8 @@ var __export = (target, all) => {
 
 // gateway-daemon.ts
 import { randomBytes as randomBytes2 } from "crypto";
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, rmSync as rmSync2, existsSync, unlinkSync } from "fs";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, rmSync as rmSync2, existsSync, unlinkSync, readdirSync as readdirSync2, renameSync } from "fs";
+import { join as join3 } from "path";
 
 // shared/access.ts
 import { randomBytes } from "crypto";
@@ -57,6 +58,7 @@ import { join } from "path";
 var STATE_DIR = process.env.CLAWVIBE_STATE_DIR ?? join(homedir(), ".claude", "channels", "clawvibe");
 var ACCESS_FILE = join(STATE_DIR, "access.json");
 var APPROVED_DIR = join(STATE_DIR, "approved");
+var PENDING_DIR = join(STATE_DIR, "pending");
 var PID_FILE = join(STATE_DIR, "server.pid");
 var SOCK_FILE = join(STATE_DIR, "gateway.sock");
 var PORT = Number(process.env.CLAWVIBE_PORT ?? 8791);
@@ -70,9 +72,11 @@ var HISTORY_TTL_MS = Number(process.env.CLAWVIBE_HISTORY_TTL_MS) || 60 * 60 * 10
 var HISTORY_MAX = Number(process.env.CLAWVIBE_HISTORY_MAX) || 100;
 var HISTORY_DEFAULT_LIMIT = 20;
 var HISTORY_DEFAULT_MAX_CHARS = 20000;
+var OUTBOX_PERSIST_DEBOUNCE_MS = Number(process.env.CLAWVIBE_OUTBOX_PERSIST_DEBOUNCE_MS) || 1000;
 function ensureStateDirs() {
   mkdirSync(STATE_DIR, { recursive: true, mode: 448 });
   mkdirSync(APPROVED_DIR, { recursive: true, mode: 448 });
+  mkdirSync(PENDING_DIR, { recursive: true, mode: 448 });
 }
 function defaultAccess() {
   return { dmPolicy: "pairing", approved: {}, pending: {} };
@@ -585,12 +589,119 @@ function endRun(runId) {
       runsBySession.delete(run.sessionKey);
   }
 }
+function outboxFile(deviceId) {
+  return join3(PENDING_DIR, `${encodeURIComponent(deviceId)}.jsonl`);
+}
+var outboxDirty = new Set;
+var outboxPersistTimer;
+function markOutboxDirty(deviceId) {
+  outboxDirty.add(deviceId);
+  if (outboxPersistTimer)
+    return;
+  outboxPersistTimer = setTimeout(() => {
+    outboxPersistTimer = undefined;
+    persistOutbox();
+  }, OUTBOX_PERSIST_DEBOUNCE_MS);
+}
+function persistOutbox() {
+  for (const deviceId of outboxDirty) {
+    const file = outboxFile(deviceId);
+    const q = outbox.get(deviceId);
+    try {
+      if (!q || q.length === 0) {
+        if (existsSync(file))
+          unlinkSync(file);
+      } else {
+        const tmp = `${file}.tmp`;
+        writeFileSync2(tmp, q.map((e) => JSON.stringify(e)).join(`
+`) + `
+`, { mode: 384 });
+        renameSync(tmp, file);
+      }
+    } catch (err) {
+      process.stderr.write(`clawvibe-daemon: outbox persist failed device=${deviceId}: ${err}
+`);
+    }
+  }
+  outboxDirty.clear();
+}
+function loadOutbox(approved) {
+  const known = new Set(Object.keys(approved));
+  const now = Date.now();
+  let files = 0, restored = 0, swept = 0;
+  let names = [];
+  try {
+    names = readdirSync2(PENDING_DIR);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const file = join3(PENDING_DIR, name);
+    if (name.endsWith(".tmp")) {
+      try {
+        unlinkSync(file);
+      } catch {}
+      continue;
+    }
+    if (!name.endsWith(".jsonl"))
+      continue;
+    let deviceId;
+    try {
+      deviceId = decodeURIComponent(name.slice(0, -".jsonl".length));
+    } catch {
+      continue;
+    }
+    if (!known.has(deviceId)) {
+      try {
+        unlinkSync(file);
+      } catch {}
+      swept++;
+      continue;
+    }
+    files++;
+    const q = [];
+    let text = "";
+    try {
+      text = readFileSync2(file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split(`
+`)) {
+      if (!line.trim())
+        continue;
+      try {
+        const entry = JSON.parse(line);
+        if (typeof entry.payload !== "string" || typeof entry.ts !== "number")
+          continue;
+        if (now - entry.ts > OUTBOX_TTL_MS)
+          continue;
+        q.push({ payload: entry.payload, ts: entry.ts });
+      } catch {}
+    }
+    while (q.length > OUTBOX_MAX)
+      q.shift();
+    if (q.length === 0) {
+      try {
+        unlinkSync(file);
+      } catch {}
+      continue;
+    }
+    outbox.set(deviceId, q);
+    restored += q.length;
+  }
+  if (files || swept) {
+    process.stderr.write(`clawvibe-daemon: outbox restored ${restored} event(s) for ${files} device(s), swept ${swept} unknown device file(s)
+`);
+  }
+}
 function enqueueOutbox(deviceId, payload) {
   const q = outbox.get(deviceId) ?? [];
   q.push({ payload, ts: Date.now() });
   while (q.length > OUTBOX_MAX)
     q.shift();
   outbox.set(deviceId, q);
+  markOutboxDirty(deviceId);
 }
 function recordHistory(sessionKey, runId, seq, text) {
   const q = history.get(sessionKey) ?? [];
@@ -613,10 +724,13 @@ function pruneOutbox() {
   const now = Date.now();
   for (const [deviceId, q] of outbox) {
     const kept = q.filter((e) => now - e.ts <= OUTBOX_TTL_MS);
+    if (kept.length === q.length)
+      continue;
     if (kept.length === 0)
       outbox.delete(deviceId);
-    else if (kept.length !== q.length)
+    else
       outbox.set(deviceId, kept);
+    markOutboxDirty(deviceId);
   }
 }
 function flushOutbox(ws, deviceId) {
@@ -624,6 +738,7 @@ function flushOutbox(ws, deviceId) {
   if (!q || q.length === 0)
     return;
   outbox.delete(deviceId);
+  markOutboxDirty(deviceId);
   const now = Date.now();
   let replayed = 0;
   for (const entry of q) {
@@ -1370,6 +1485,7 @@ try {
 writeFileSync2(PID_FILE, String(process.pid));
 process.stderr.write(`clawvibe-daemon: listening on http://${HOSTNAME}:${PORT} (ipc ${SOCK_FILE})
 `);
+loadOutbox(readAccess().approved);
 refreshPinnedSnapshot();
 var shuttingDown = false;
 function shutdown(sig) {
@@ -1378,6 +1494,9 @@ function shutdown(sig) {
   shuttingDown = true;
   process.stderr.write(`clawvibe-daemon: ${sig} \u2014 shutting down
 `);
+  for (const deviceId of outbox.keys())
+    outboxDirty.add(deviceId);
+  persistOutbox();
   try {
     httpServer.stop(true);
   } catch {}
