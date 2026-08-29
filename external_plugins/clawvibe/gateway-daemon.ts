@@ -17,13 +17,15 @@
  */
 
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, rmSync, existsSync, unlinkSync } from 'fs'
+import { readFileSync, writeFileSync, rmSync, existsSync, unlinkSync, readdirSync, renameSync } from 'fs'
+import { join } from 'path'
 import type { ServerWebSocket, Socket } from 'bun'
 
 import {
-  STATE_DIR, ACCESS_FILE, PID_FILE, SOCK_FILE, PORT, HOSTNAME,
+  STATE_DIR, ACCESS_FILE, PID_FILE, SOCK_FILE, PENDING_DIR, PORT, HOSTNAME,
   TICK_INTERVAL_MS, HANDSHAKE_TIMEOUT_MS, ACTIVE_RUN_TTL_MS, OUTBOX_TTL_MS, OUTBOX_MAX,
   HISTORY_TTL_MS, HISTORY_MAX, HISTORY_DEFAULT_LIMIT, HISTORY_DEFAULT_MAX_CHARS,
+  OUTBOX_PERSIST_DEBOUNCE_MS,
   ensureStateDirs, readAccess, writeAccess, newPairCode, newToken,
   tokenToDevice, newBootstrapToken, consumeBootstrapToken, drainApprovalSentinels,
   type ApprovedDevice,
@@ -396,6 +398,118 @@ function endRun(runId: string): void {
   if (set) { set.delete(runId); if (set.size === 0) runsBySession.delete(run.sessionKey) }
 }
 
+// ── Outbox persistence (#43) ─────────────────────────────────────────────────
+//
+// #23 made a queued reply survive the phone going away. It did not make it
+// survive the DAEMON going away — and the daemon goes away routinely here:
+// `clawvibe update` swaps the install, `agents restart` SIGTERMs it, and it
+// exit(0)s on EADDRINUSE. In all of those, everything queued for an absent
+// phone vanished silently, which is the exact shape of loss #23 set out to end.
+//
+// Spilled as one JSONL file per device under PENDING_DIR, entries byte-identical
+// to the frames they replay, so the format is just the queue one line per entry
+// and there is no new schema to version.
+//
+// Deliberately NOT persisted: the chat.history cache (#44). It records on every
+// delivered message, so persisting it would put disk I/O on the delivery fast
+// path — the thing this file's debounce exists to keep it off. History is a
+// convenience cache and is documented as such; the outbox is a delivery
+// guarantee, and only the guarantee is worth the write.
+//
+// Single writer: only the daemon touches these files, and the daemon is a
+// singleton (PID file + socket + port bind), so no filelock is taken. That is a
+// decision, not an oversight — revisit it the moment anything else writes here.
+
+/** Device ids come off the wire, so they are not trusted as path components. */
+function outboxFile(deviceId: string): string {
+  return join(PENDING_DIR, `${encodeURIComponent(deviceId)}.jsonl`)
+}
+
+const outboxDirty = new Set<string>()
+let outboxPersistTimer: Timer | undefined
+
+/** Queue a spill. Coalesced, because a burst of queued events is one queue. */
+function markOutboxDirty(deviceId: string): void {
+  outboxDirty.add(deviceId)
+  if (outboxPersistTimer) return
+  outboxPersistTimer = setTimeout(() => {
+    outboxPersistTimer = undefined
+    persistOutbox()
+  }, OUTBOX_PERSIST_DEBOUNCE_MS)
+}
+
+/** Write every dirty device's queue. Called on the debounce and on shutdown. */
+function persistOutbox(): void {
+  for (const deviceId of outboxDirty) {
+    const file = outboxFile(deviceId)
+    const q = outbox.get(deviceId)
+    try {
+      if (!q || q.length === 0) {
+        if (existsSync(file)) unlinkSync(file)
+      } else {
+        // tmp + rename: a daemon killed mid-write must not leave a half-written
+        // queue that the next start would parse as a truncated one.
+        const tmp = `${file}.tmp`
+        writeFileSync(tmp, q.map(e => JSON.stringify(e)).join('\n') + '\n', { mode: 0o600 })
+        renameSync(tmp, file)
+      }
+    } catch (err) {
+      process.stderr.write(`clawvibe-daemon: outbox persist failed device=${deviceId}: ${err}\n`)
+    }
+  }
+  outboxDirty.clear()
+}
+
+/**
+ * Reload spilled queues at start.
+ *
+ * Bounds are applied again HERE, not just at enqueue: a daemon that was down
+ * for a day must not resurrect a day-old backlog just because it was written
+ * while it was fresh.
+ */
+function loadOutbox(approved: Record<string, ApprovedDevice>): void {
+  const known = new Set(Object.keys(approved))
+  const now = Date.now()
+  let files = 0, restored = 0, swept = 0
+  let names: string[] = []
+  try { names = readdirSync(PENDING_DIR) } catch { return }
+  for (const name of names) {
+    const file = join(PENDING_DIR, name)
+    if (name.endsWith('.tmp')) { try { unlinkSync(file) } catch {} ; continue }
+    if (!name.endsWith('.jsonl')) continue
+    let deviceId: string
+    try { deviceId = decodeURIComponent(name.slice(0, -'.jsonl'.length)) } catch { continue }
+    // A phone that re-paired has a new device_id, and access.json already
+    // carries two rows for one physical handset from an earlier re-pair. Files
+    // for ids nobody can authenticate as again would accumulate forever.
+    if (!known.has(deviceId)) {
+      try { unlinkSync(file) } catch {}
+      swept++
+      continue
+    }
+    files++
+    const q: { payload: string; ts: number }[] = []
+    let text = ''
+    try { text = readFileSync(file, 'utf8') } catch { continue }
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const entry = JSON.parse(line) as { payload?: unknown; ts?: unknown }
+        if (typeof entry.payload !== 'string' || typeof entry.ts !== 'number') continue
+        if (now - entry.ts > OUTBOX_TTL_MS) continue
+        q.push({ payload: entry.payload, ts: entry.ts })
+      } catch { /* a truncated tail is skipped, not fatal */ }
+    }
+    while (q.length > OUTBOX_MAX) q.shift()
+    if (q.length === 0) { try { unlinkSync(file) } catch {}; continue }
+    outbox.set(deviceId, q)
+    restored += q.length
+  }
+  if (files || swept) {
+    process.stderr.write(`clawvibe-daemon: outbox restored ${restored} event(s) for ${files} device(s), swept ${swept} unknown device file(s)\n`)
+  }
+}
+
 function enqueueOutbox(deviceId: string, payload: string): void {
   const q = outbox.get(deviceId) ?? []
   q.push({ payload, ts: Date.now() })
@@ -403,6 +517,7 @@ function enqueueOutbox(deviceId: string, payload: string): void {
   // a complete replay of a stale backlog.
   while (q.length > OUTBOX_MAX) q.shift()
   outbox.set(deviceId, q)
+  markOutboxDirty(deviceId)
 }
 
 function recordHistory(sessionKey: string, runId: string, seq: number, text: string): void {
@@ -425,8 +540,10 @@ function pruneOutbox(): void {
   const now = Date.now()
   for (const [deviceId, q] of outbox) {
     const kept = q.filter(e => now - e.ts <= OUTBOX_TTL_MS)
+    if (kept.length === q.length) continue
     if (kept.length === 0) outbox.delete(deviceId)
-    else if (kept.length !== q.length) outbox.set(deviceId, kept)
+    else outbox.set(deviceId, kept)
+    markOutboxDirty(deviceId)
   }
 }
 
@@ -441,6 +558,7 @@ function flushOutbox(ws: ServerWebSocket<WSData>, deviceId: string): void {
   const q = outbox.get(deviceId)
   if (!q || q.length === 0) return
   outbox.delete(deviceId)
+  markOutboxDirty(deviceId)
   const now = Date.now()
   let replayed = 0
   for (const entry of q) {
@@ -1195,6 +1313,9 @@ try {
 writeFileSync(PID_FILE, String(process.pid))
 process.stderr.write(`clawvibe-daemon: listening on http://${HOSTNAME}:${PORT} (ipc ${SOCK_FILE})\n`)
 
+// Reload anything the previous daemon still owed an absent device (#43).
+loadOutbox(readAccess().approved)
+
 // Populate the pinned-session snapshot immediately, so the first agents.list after
 // a daemon start isn't answered from an empty one.
 refreshPinnedSnapshot()
@@ -1206,6 +1327,10 @@ function shutdown(sig: string): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write(`clawvibe-daemon: ${sig} — shutting down\n`)
+  // Before the servers stop: whatever is still queued is exactly what #43 is
+  // about, and the debounce may not have fired yet.
+  for (const deviceId of outbox.keys()) outboxDirty.add(deviceId)
+  persistOutbox()
   try { httpServer.stop(true) } catch {}
   try { ipcServer.stop(true) } catch {}
   try { rmSync(PID_FILE) } catch {}
