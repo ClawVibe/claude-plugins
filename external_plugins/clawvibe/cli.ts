@@ -44,7 +44,7 @@ const REPLY_TOOLS = ['mcp__plugin_clawvibe_clawvibe__reply', 'mcp__plugin_clawvi
 // reporting "both replies sent" (settled → reaped ~60 min later), the other "standing by
 // for ClawVibe device message" (survived indefinitely). Pinning covers the settled case,
 // but keeping the agent in a waiting state is what makes survival deterministic.
-const SEED = 'You are online as a ClawVibe channel agent. Wait for device messages; when one arrives, reply to it using the clawvibe reply tool, then go straight back to waiting. This is a standing assignment, not a task: you are never finished, so always end your turn standing by rather than reporting your work complete. Take no other action while waiting.'
+const SEED = 'You are online as a ClawVibe channel agent. Always answer on the channel a message arrived on: a message tagged source="clawvibe" is answered with the clawvibe reply tool, one tagged source="telegram" with the telegram reply tool — reply on the wrong channel and the person who asked receives nothing. Wait for device messages; when one arrives, reply to it using the reply tool for that channel, then go straight back to waiting. This is a standing assignment, not a task: you are never finished, so always end your turn standing by rather than reporting your work complete. Take no other action while waiting.'
 
 // `channels` are EXTRA channel servers this agent listens on, appended after the
 // mandatory ClawVibe one. The CLI only registers notifications/claude/channel
@@ -173,7 +173,9 @@ function writeAgentDef(id: string, name: string | undefined, emoji: string | und
   const fm = ['---', `name: ${id}`, `description: ${display} — ClawVibe channel agent.`, '---', '']
   const persona = prompt ?? `You are ${display}, reachable over the ClawVibe mobile app. Keep replies brief and in character.`
   const channel =
-    `\n\n## ClawVibe channel\n` +
+    `\n\n## Channels\n` +
+    `ALWAYS REPLY ON THE CHANNEL THE MESSAGE CAME FROM. A message tagged \`source="clawvibe"\` is answered with the ClawVibe \`reply\` tool; one tagged \`source="telegram"\` is answered with the Telegram reply tool. Reply on the wrong channel and the person who asked receives nothing. Replying elsewhere as well is fine — replying ONLY elsewhere is silence.\n` +
+    `\n## ClawVibe channel\n` +
     `Your display name is "${display}" and your emoji is ${em}. On EVERY \`reply\`, set the \`name\` ("${display}") and \`emoji\` (${em}) parameters.\n` +
     `When a device message arrives (a \`<channel source="clawvibe" conversation_id="...">\` tag), reply to it with the \`reply\` tool using that conversation_id. Take no other action unless asked.\n` +
     `After replying, return to standing by. You are a long-lived channel agent, never a finished task — do not report your work as complete, or the runtime will reclaim this session and you will drop out of the app.\n`

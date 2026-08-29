@@ -278,6 +278,13 @@ How it decides:
 - On a miss it prints `{"decision":"block","reason":...}`, which the host feeds back to the
   model so the turn continues and the agent actually sends.
 
+The prompt side of the same rule (#49) is stated **first** in all three places that reach an
+agent — `channel-client.ts` MCP `instructions`, `cli.ts` `SEED`, and the channel block
+`writeAgentDef` bakes into a new `~/.claude/agents/<id>.md`: *answer on the channel the
+message arrived on.* The hook is the backstop; a block costs a whole extra turn, the rule
+costs a sentence. Note `writeAgentDef` never overwrites an existing `.md`, so **agent files
+that already exist must be edited by hand** — the plugin cannot reach them.
+
 **Loop safety is load-bearing.** `stop_hook_active` is true when we are already inside a
 blocked stop; the hook then records the miss to `$CLAWVIBE_STATE_DIR/reply-guard.log` and
 exits 0. An unconditional block is an infinite loop that burns tokens forever. (The host
