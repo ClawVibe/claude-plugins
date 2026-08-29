@@ -14087,6 +14087,10 @@ var HANDSHAKE_TIMEOUT_MS = 1e4;
 var ACTIVE_RUN_TTL_MS = Number(process.env.CLAWVIBE_ACTIVE_RUN_TTL_MS) || 5 * 60 * 1000;
 var OUTBOX_TTL_MS = Number(process.env.CLAWVIBE_OUTBOX_TTL_MS) || 5 * 60 * 1000;
 var OUTBOX_MAX = Number(process.env.CLAWVIBE_OUTBOX_MAX) || 200;
+var HISTORY_TTL_MS = Number(process.env.CLAWVIBE_HISTORY_TTL_MS) || 60 * 60 * 1000;
+var HISTORY_MAX = Number(process.env.CLAWVIBE_HISTORY_MAX) || 100;
+var HISTORY_DEFAULT_LIMIT = 20;
+var HISTORY_DEFAULT_MAX_CHARS = 20000;
 function ensureStateDirs() {
   mkdirSync(STATE_DIR, { recursive: true, mode: 448 });
   mkdirSync(APPROVED_DIR, { recursive: true, mode: 448 });

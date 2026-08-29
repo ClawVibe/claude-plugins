@@ -66,6 +66,10 @@ var HANDSHAKE_TIMEOUT_MS = 1e4;
 var ACTIVE_RUN_TTL_MS = Number(process.env.CLAWVIBE_ACTIVE_RUN_TTL_MS) || 5 * 60 * 1000;
 var OUTBOX_TTL_MS = Number(process.env.CLAWVIBE_OUTBOX_TTL_MS) || 5 * 60 * 1000;
 var OUTBOX_MAX = Number(process.env.CLAWVIBE_OUTBOX_MAX) || 200;
+var HISTORY_TTL_MS = Number(process.env.CLAWVIBE_HISTORY_TTL_MS) || 60 * 60 * 1000;
+var HISTORY_MAX = Number(process.env.CLAWVIBE_HISTORY_MAX) || 100;
+var HISTORY_DEFAULT_LIMIT = 20;
+var HISTORY_DEFAULT_MAX_CHARS = 20000;
 function ensureStateDirs() {
   mkdirSync(STATE_DIR, { recursive: true, mode: 448 });
   mkdirSync(APPROVED_DIR, { recursive: true, mode: 448 });
@@ -531,6 +535,7 @@ var clients = new Map;
 var handshakeTimers = new Map;
 var outbox = new Map;
 var lastPong = new WeakMap;
+var history = new Map;
 var activeRuns = new Map;
 var runsBySession = new Map;
 var runSeq = new Map;
@@ -586,6 +591,23 @@ function enqueueOutbox(deviceId, payload) {
   while (q.length > OUTBOX_MAX)
     q.shift();
   outbox.set(deviceId, q);
+}
+function recordHistory(sessionKey, runId, seq, text) {
+  const q = history.get(sessionKey) ?? [];
+  q.push({ runId, seq, text, ts: Date.now() });
+  while (q.length > HISTORY_MAX)
+    q.shift();
+  history.set(sessionKey, q);
+}
+function pruneHistory() {
+  const now = Date.now();
+  for (const [sessionKey, q] of history) {
+    const kept = q.filter((e) => now - e.ts <= HISTORY_TTL_MS);
+    if (kept.length === 0)
+      history.delete(sessionKey);
+    else if (kept.length !== q.length)
+      history.set(sessionKey, kept);
+  }
 }
 function pruneOutbox() {
   const now = Date.now();
@@ -722,12 +744,15 @@ function broadcastChatEvent(runId, sessionKey, state, opts = {}) {
     seq: nextRunSeq(runId),
     state
   };
+  const seq = payload.seq;
   if (opts.text !== undefined) {
     payload.message = {
       role: "assistant",
       content: [{ type: "text", text: opts.text }],
       timestamp: new Date().toISOString()
     };
+    if (state === "final")
+      recordHistory(sessionKey, runId, seq, opts.text);
   }
   if (opts.errorMessage !== undefined)
     payload.errorMessage = opts.errorMessage;
@@ -746,6 +771,7 @@ setInterval(() => {
   reapDeadSockets();
   pruneActiveRuns();
   pruneOutbox();
+  pruneHistory();
   refreshPinnedSnapshot();
   broadcastEvent({ type: "event", event: "tick", payload: null, seq: nextEventSeq(), stateVersion: null });
 }, TICK_INTERVAL_MS);
@@ -893,6 +919,53 @@ function handleConnect(ws, req) {
   process.stderr.write(`clawvibe-daemon: device authenticated id=${device.device_id} name="${device.device_name}"
 `);
   flushOutbox(ws, device.device_id);
+}
+function handleChatHistory(ws, req) {
+  const params = req.params ?? {};
+  const sessionKey = params.sessionKey;
+  if (typeof sessionKey !== "string" || !sessionKey) {
+    sendFrame(ws, { type: "res", id: req.id, ok: false, error: { message: "sessionKey required" } });
+    return;
+  }
+  const owner = deviceIdFromSessionKey(sessionKey);
+  if (owner && owner !== ws.data.device_id) {
+    process.stderr.write(`clawvibe-daemon: chat.history refused, device=${ws.data.device_id} asked for session owned by ${owner}
+`);
+    sendFrame(ws, { type: "res", id: req.id, ok: true, payload: { messages: [] } });
+    return;
+  }
+  const rawLimit = typeof params.limit === "number" ? params.limit : HISTORY_DEFAULT_LIMIT;
+  const limit = Math.max(0, Math.min(Math.floor(rawLimit), HISTORY_MAX));
+  const rawMaxChars = typeof params.maxChars === "number" ? params.maxChars : HISTORY_DEFAULT_MAX_CHARS;
+  const maxChars = Math.max(0, Math.floor(rawMaxChars));
+  const now = Date.now();
+  const all = (history.get(sessionKey) ?? []).filter((e) => now - e.ts <= HISTORY_TTL_MS);
+  const picked = [];
+  let chars = 0;
+  for (let i = all.length - 1;i >= 0 && picked.length < limit; i--) {
+    const entry = all[i];
+    if (picked.length > 0 && chars + entry.text.length > maxChars)
+      break;
+    chars += entry.text.length;
+    picked.push(entry);
+  }
+  picked.reverse();
+  process.stderr.write(`clawvibe-daemon: chat.history session=${sessionKey} -> ${picked.length}/${all.length} message(s), ${chars} chars
+`);
+  sendFrame(ws, {
+    type: "res",
+    id: req.id,
+    ok: true,
+    payload: {
+      messages: picked.map((e) => ({
+        role: "assistant",
+        content: [{ type: "text", text: e.text }],
+        timestamp: new Date(e.ts).toISOString(),
+        runId: e.runId,
+        seq: e.seq
+      }))
+    }
+  });
 }
 function parseSensoryTags(message) {
   let context, location, voiceData;
@@ -1051,6 +1124,8 @@ function handleRPC(ws, req) {
       return handleAgentsList(ws, req);
     case "agent.identity.get":
       return handleAgentIdentityGet(ws, req);
+    case "chat.history":
+      return handleChatHistory(ws, req);
     default:
       sendFrame(ws, { type: "res", id: req.id, ok: false, error: { message: `unknown method: ${req.method}` } });
   }

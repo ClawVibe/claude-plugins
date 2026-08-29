@@ -28,6 +28,12 @@ export const ACTIVE_RUN_TTL_MS = Number(process.env.CLAWVIBE_ACTIVE_RUN_TTL_MS) 
 export const OUTBOX_TTL_MS = Number(process.env.CLAWVIBE_OUTBOX_TTL_MS) || 5 * 60 * 1000
 /** Hard cap per device, so a phone that never comes back cannot leak the daemon's heap. */
 export const OUTBOX_MAX = Number(process.env.CLAWVIBE_OUTBOX_MAX) || 200
+/** chat.history: bounded per-sessionKey transcript cache (#44). Not durable storage. */
+export const HISTORY_TTL_MS = Number(process.env.CLAWVIBE_HISTORY_TTL_MS) || 60 * 60 * 1000
+export const HISTORY_MAX = Number(process.env.CLAWVIBE_HISTORY_MAX) || 100
+/** Defaults when the client omits them; the client currently sends 20 / 20000. */
+export const HISTORY_DEFAULT_LIMIT = 20
+export const HISTORY_DEFAULT_MAX_CHARS = 20_000
 
 export function ensureStateDirs(): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
