@@ -15,6 +15,8 @@ import { join } from 'path'
 export const STATE_DIR = process.env.CLAWVIBE_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'clawvibe')
 export const ACCESS_FILE = join(STATE_DIR, 'access.json')
 export const APPROVED_DIR = join(STATE_DIR, 'approved')
+/** Where the outbox is spilled so a daemon restart doesn't destroy it (#43). */
+export const PENDING_DIR = join(STATE_DIR, 'pending')
 export const PID_FILE = join(STATE_DIR, 'server.pid')
 export const SOCK_FILE = join(STATE_DIR, 'gateway.sock')
 export const PORT = Number(process.env.CLAWVIBE_PORT ?? 8791)
@@ -34,10 +36,19 @@ export const HISTORY_MAX = Number(process.env.CLAWVIBE_HISTORY_MAX) || 100
 /** Defaults when the client omits them; the client currently sends 20 / 20000. */
 export const HISTORY_DEFAULT_LIMIT = 20
 export const HISTORY_DEFAULT_MAX_CHARS = 20_000
+/**
+ * How long to coalesce outbox writes before spilling to disk (#43).
+ *
+ * The outbox is only ever written for a device that is NOT connected, so this
+ * is off the delivery fast path already; the debounce is what stops a burst of
+ * queued events becoming a burst of file writes.
+ */
+export const OUTBOX_PERSIST_DEBOUNCE_MS = Number(process.env.CLAWVIBE_OUTBOX_PERSIST_DEBOUNCE_MS) || 1000
 
 export function ensureStateDirs(): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(APPROVED_DIR, { recursive: true, mode: 0o700 })
+  mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
 }
 
 // ── Access state ─────────────────────────────────────────────────────────────
