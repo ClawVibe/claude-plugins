@@ -20,6 +20,7 @@ clawvibe-plugin/                    # marketplace repo root
 │   ├── channel-client.ts           # per-session MCP server (`start`): connects to daemon over IPC, registers its agent
 │   ├── cli.ts                      # automation CLI: setup / agent add|rm|list / agents up|down / install-service
 │   ├── shared/{protocol,access}.ts  # wire+IPC types & sessionKey parser; config+pairing
+│   ├── hooks/{hooks.json,reply-guard.ts}  # Stop hook: block a channel turn that never called `reply`
 │   ├── test/storm-regression.ts    # manual regression check: `bun run test:storm`
 │   ├── dist/                       # COMMITTED self-contained bundle (sdk inlined) — what `start`/daemon run
 │   ├── qr.py                       # QR code generator + interactive pairing tool (hits daemon HTTP)
@@ -169,6 +170,59 @@ Key mechanics:
 - Tests: `bun run test:update` (installer safety), `bun run test:listing`, and `bun run test:reachability` (end-to-end: a client that registers and never answers its probe must still be listed reachable by agentId — issue #25). Note `test:storm` asserts only on `reachable` rows, because `pins.json` is the real machine's file and is deliberately **not** redirected by `CLAWVIBE_STATE_DIR`.
 
 *Known gap:* nothing sweeps a pin when its session dies, so corpses accumulate. Harmless now that the list intersects with the live roster, but `pins.json` grows unbounded.
+
+### Keeping agents alive #3: THE REPLY GUARD (Stop hook)
+
+An agent can generate a perfectly good reply **into its transcript** and never call
+`mcp__plugin_clawvibe_clawvibe__reply` / `mcp__plugin_telegram_telegram__reply`. The device
+gets nothing and the agent believes it answered — observed repeatedly on SpongeBob. Both the
+MCP `instructions` and the agent prompt already say "calling reply is mandatory"; prompt
+discipline does not hold on its own, so `hooks/reply-guard.ts` is the mechanical backstop.
+
+It ships as a **plugin hook** (`hooks/hooks.json`, `Stop` event, invoked as
+`bun "${CLAUDE_PLUGIN_ROOT}/hooks/reply-guard.ts"`), so it deploys with `clawvibe update`
+to every box and needs no `settings.json` entry.
+
+How it decides:
+- **The most recent PROMPT, not the most recent user record.** Tool results are also
+  `type: "user"`; a prompt's `message.content` is a plain **string**, a tool result's is a
+  block array. Getting this wrong makes the hook blind on any turn that used a tool.
+- **Channel turns only**, keyed on `origin.kind === "channel"` (`origin.server` names the
+  plugin). Intercom-woken and interactive CLI turns have no device waiting and are exempt.
+  Liveness probes (`clawvibe:probe:*`) are deliberately **in** scope — they must reply.
+- **Matching is per-CHANNEL, never per-conversation_id** (`/^mcp__(plugin_.+?)__(reply|edit_message)$/`;
+  group 1 is the MCP server, and `origin.server`'s colons map to underscores). One inbound may
+  legitimately be answered across several conversations on the same channel, and `edit_message`
+  is a legitimate way to answer, so id equality produces false positives. Sidechain (subagent)
+  records never count.
+- **Answering on the WRONG channel is also blocked (#47).** An agent paired to both ClawVibe
+  and Telegram can answer a Telegram message into the app; the guard used to see *a* reply
+  tool and allow it, and the sender still got silence. It now blocks when the **originating**
+  channel got nothing. Fan-out stays legal — replying there *and* elsewhere passes — and an
+  unrecognised `origin.server` stays lenient. This hook catches silence; it does not police
+  fan-out.
+- On a miss it prints `{"decision":"block","reason":...}`, which the host feeds back to the
+  model so the turn continues and the agent actually sends.
+
+**Loop safety is load-bearing.** `stop_hook_active` is true when we are already inside a
+blocked stop; the hook then records the miss to `$CLAWVIBE_STATE_DIR/reply-guard.log` and
+exits 0. An unconditional block is an infinite loop that burns tokens forever. (The host
+also caps consecutive Stop blocks at 8, overridable via `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` —
+do not rely on that as the primary guard.)
+
+**Every failure path exits 0.** An unparseable payload, a missing transcript, a half-written
+trailing JSONL line — none of them may break a turn. A hook that can wedge the fleet is
+worse than the bug it fixes.
+
+**A block is not a delivery guarantee.** `reply` is fire-and-forget and returns "sent" after
+the IPC write, so this catches "never called the tool", not "the call was dropped" (see the
+outbox and ack issues). There is also no way for an agent to declare "this inbound needed no
+reply"; if we ever want that it needs an explicit escape hatch, not a guess by the hook.
+
+Tests: `bun run test:guard` — runs the real hook as a subprocess against synthetic
+transcripts (miss, replied, edit_message, wrong-channel, both-channels, telegram origin,
+other-conversation, unknown server, human, intercom, loop, tool_result, probe, sidechain,
+unreadable transcript).
 
 ### Agent idle-stop & waking
 - **Idle-stop**: Claude Code's agent-view supervisor stops an idle, unattended background session after ~1h. When that happens the channel client dies → the agent **deregisters and drops out of the app**. `install-service` (or a Coder `startup_script`) runs `agents up` only at login/boot/workspace-start, so it does **not** counter idle-stop. *(Known gap: a periodic respawn-based heal is not built yet — without it, agents go offline ~1h after their last activity until something re-launches/wakes them.)*
