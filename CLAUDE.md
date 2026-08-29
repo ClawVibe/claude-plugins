@@ -21,7 +21,7 @@ clawvibe-plugin/                    # marketplace repo root
 │   ├── cli.ts                      # automation CLI: setup / agent add|rm|list / agents up|down / install-service
 │   ├── shared/{protocol,access}.ts  # wire+IPC types & sessionKey parser; config+pairing
 │   ├── hooks/{hooks.json,reply-guard.ts}  # Stop hook: block a channel turn that never called `reply`
-│   ├── test/{storm-regression,run-keying}.ts  # regression checks: `bun run test:storm` / `test:runs`
+│   ├── test/{storm-regression,run-keying,outbox}.ts  # regression checks: `bun run test:storm` / `test:runs` / `test:outbox`
 │   ├── dist/                       # COMMITTED self-contained bundle (sdk inlined) — what `start`/daemon run
 │   ├── qr.py                       # QR code generator + interactive pairing tool (hits daemon HTTP)
 │   ├── bin/clawvibe                # CLI dispatcher (qr→qr.py; setup/agent/agents/install-service→cli.ts)
@@ -123,6 +123,47 @@ Process lifecycle (split model):
 - **Daemon detaches via `setsid`**: the auto-spawned daemon runs in its own session, independent of the spawning agent (so restarting an agent never destabilises the shared gateway).
 - **Client stdin close → exit**: the per-session `channel-client` (not the daemon) exits when its Claude session ends; it deregisters from the daemon.
 - **Inert without an agent**: a session with the plugin enabled but no `--agent`/`CLAWVIBE_AGENT_ID` does not register (avoids a bogus `default` agent in the picker).
+
+### The per-device outbox (#23)
+
+A chat event that reached no live socket used to be counted and destroyed — the entire
+failure handling was `broadcast event=chat sent=0`. `handleConnect` sent a snapshot with no
+pending messages, so reconnecting recovered nothing. That is the wifi-to-cellular handoff on
+a moving vehicle, and it made the loss **permanent rather than delayed**. Confirmed in the
+wild: the daemon log, the agent's transcript showing it had answered, and `sent=0` for the
+frame nobody received.
+
+`broadcastEvent` now retains instead of dropping: when `sent === 0` on a **targeted chat**
+event, the payload goes into a per-device queue and is replayed in `handleConnect` **after
+`hello_ok`** (the app needs its session before a replayed event means anything).
+
+- **Targeted chat events only.** An untargeted broadcast has no device to replay to, and
+  ticks/presence are worthless late.
+- **Replays are byte-identical**, so they keep their original `(runId, seq)` and the client
+  can dedupe. That is only safe because seq no longer restarts at 0 within a run — **#24 is a
+  hard prerequisite, not a nicety.**
+- **Bounded twice over**: `OUTBOX_MAX` (200) drops the *oldest* first, and `OUTBOX_TTL_MS`
+  (5 min) expires the rest on the tick. A phone that never comes back must not be able to
+  leak the daemon's heap.
+- **The queue is drained on flush**, not re-sent on every reconnect.
+
+**Server-side ping/pong is part of the same fix, not a bonus.** `reapDeadSockets` only
+inspects `readyState`, and a half-open socket reports `1` — so the daemon logged `sent=1` for
+a frame that reached nobody and the outbox would never engage for the very case it exists
+for. The tick now pings every device socket and closes any that has not ponged in 2.5 ticks
+(`lastPong`, a WeakMap so closed sockets need no cleanup). Note the failure direction: a
+false positive here disconnects a *working* phone every 30s, so the regression asserts that a
+healthy socket survives many ticks untouched.
+
+*Not done, deliberately:* the outbox is in memory only, so a daemon restart still loses it,
+and there is no client ack — the queue is trimmed by TTL and cap rather than by delivery
+confirmation. Both are follow-ups (see the ack issue); neither is needed for the reconnect
+case this fixes. `chat.history` is still unimplemented, so the app's calls to it still return
+`unknown method` — that is the other half of recovery and remains open.
+
+Tests: `bun run test:outbox` — replay on reconnect, original runId preserved, cap keeps the
+newest, TTL expiry, drain-once, and no false pong eviction. Verified to **fail on the #24
+branch** (6 of 11) and pass here.
 
 ### Run bookkeeping: `activeRuns` is keyed by runId, `runSeq` outlives its run
 
