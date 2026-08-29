@@ -22,7 +22,7 @@ import type { ServerWebSocket, Socket } from 'bun'
 
 import {
   STATE_DIR, ACCESS_FILE, PID_FILE, SOCK_FILE, PORT, HOSTNAME,
-  TICK_INTERVAL_MS, HANDSHAKE_TIMEOUT_MS, ACTIVE_RUN_TTL_MS,
+  TICK_INTERVAL_MS, HANDSHAKE_TIMEOUT_MS, ACTIVE_RUN_TTL_MS, OUTBOX_TTL_MS, OUTBOX_MAX,
   ensureStateDirs, readAccess, writeAccess, newPairCode, newToken,
   tokenToDevice, newBootstrapToken, consumeBootstrapToken, drainApprovalSentinels,
   type ApprovedDevice,
@@ -321,6 +321,17 @@ const ipcServer = Bun.listen<SockState>({
 
 const clients = new Map<string, Set<ServerWebSocket<WSData>>>()
 const handshakeTimers = new Map<ServerWebSocket<WSData>, Timer>()
+// Per-device outbox (#23). A chat event that reached nobody used to be counted
+// (`sent=0`) and destroyed — the wifi-to-cellular handoff case on a moving
+// vehicle, which made the loss permanent rather than delayed. Bounded by
+// OUTBOX_MAX and OUTBOX_TTL_MS: a phone that never comes back must not be able
+// to leak the daemon's heap.
+const outbox = new Map<string, { payload: string; ts: number }[]>()
+// Last pong per device socket. reapDeadSockets only inspected `readyState`, and
+// a half-open socket reports 1 — so the daemon logged `sent=1` for a frame that
+// reached nobody, and the outbox would never engage for the very case it exists
+// for. WeakMap so a closed socket needs no cleanup.
+const lastPong = new WeakMap<ServerWebSocket<WSData>, number>()
 // Keyed by runId, NOT sessionKey (#24). Keying by sessionKey meant a second
 // chat.send on the same conversation overwrote the first entry, and the orphaned
 // run then received no chat event ever — not final, not error, and not even the
@@ -374,6 +385,70 @@ function endRun(runId: string): void {
   if (set) { set.delete(runId); if (set.size === 0) runsBySession.delete(run.sessionKey) }
 }
 
+function enqueueOutbox(deviceId: string, payload: string): void {
+  const q = outbox.get(deviceId) ?? []
+  q.push({ payload, ts: Date.now() })
+  // Drop oldest first: a replay of the most recent messages is worth more than
+  // a complete replay of a stale backlog.
+  while (q.length > OUTBOX_MAX) q.shift()
+  outbox.set(deviceId, q)
+}
+
+function pruneOutbox(): void {
+  const now = Date.now()
+  for (const [deviceId, q] of outbox) {
+    const kept = q.filter(e => now - e.ts <= OUTBOX_TTL_MS)
+    if (kept.length === 0) outbox.delete(deviceId)
+    else if (kept.length !== q.length) outbox.set(deviceId, kept)
+  }
+}
+
+/**
+ * Replay undelivered chat events to a device that just authenticated.
+ *
+ * Replays are byte-identical to the original frames, so they carry their
+ * original `(runId, seq)` and the client can dedupe on it — which is only safe
+ * because seq no longer restarts at 0 within a run (#24).
+ */
+function flushOutbox(ws: ServerWebSocket<WSData>, deviceId: string): void {
+  const q = outbox.get(deviceId)
+  if (!q || q.length === 0) return
+  outbox.delete(deviceId)
+  const now = Date.now()
+  let replayed = 0
+  for (const entry of q) {
+    if (now - entry.ts > OUTBOX_TTL_MS) continue
+    try { if (ws.readyState === 1) { ws.send(entry.payload); replayed++ } } catch (err) {
+      process.stderr.write(`clawvibe-daemon: outbox replay failed: ${err}\n`)
+    }
+  }
+  process.stderr.write(`clawvibe-daemon: outbox replayed ${replayed}/${q.length} event(s) to device=${deviceId}\n`)
+}
+
+/**
+ * Close device sockets that stopped answering pings, then ping the rest.
+ *
+ * Without this a half-open socket keeps `readyState === 1` forever, so
+ * broadcasts are counted as delivered and never reach the outbox.
+ */
+function pingDeviceSockets(): void {
+  const now = Date.now()
+  const deadline = TICK_INTERVAL_MS * 2.5
+  for (const set of clients.values()) {
+    for (const ws of set) {
+      if (ws.readyState !== 1) continue
+      const seen = lastPong.get(ws)
+      if (seen !== undefined && now - seen > deadline) {
+        process.stderr.write(`clawvibe-daemon: no pong in ${Math.round((now - seen) / 1000)}s, closing device=${ws.data.device_id}\n`)
+        try { ws.close(4002, 'no pong') } catch {}
+        continue
+      }
+      if (seen === undefined) lastPong.set(ws, now)
+      try { ws.ping() } catch {}
+    }
+  }
+}
+
 function reapDeadSockets(): void {
   let reaped = 0
   for (const [deviceId, set] of clients) {
@@ -420,8 +495,18 @@ function broadcastEvent(frame: EventFrame, targetDeviceId?: string): void {
   }
   if (targetDeviceId) clients.get(targetDeviceId)?.forEach(send)
   else for (const set of clients.values()) set.forEach(send)
+  // Retain, don't destroy (#23). Only targeted chat events: a broadcast with no
+  // target has no device to replay to, and ticks/presence are worthless late.
+  if (targetDeviceId && sent === 0 && frame.event === 'chat') {
+    enqueueOutbox(targetDeviceId, payload)
+  }
   if (frame.event !== 'tick') {
-    process.stderr.write(`clawvibe-daemon: broadcast event=${frame.event} sent=${sent} skipped=${skipped}\n`)
+    process.stderr.write(
+      `clawvibe-daemon: broadcast event=${frame.event} sent=${sent} skipped=${skipped}` +
+      (targetDeviceId && sent === 0 && frame.event === 'chat'
+        ? ` queued=${outbox.get(targetDeviceId)?.length ?? 0}`
+        : '') + `\n`,
+    )
   }
 }
 
@@ -460,8 +545,10 @@ function broadcastChatEvent(
 
 // 30s tick keepalive + dead socket reaper + activeRuns pruner
 setInterval(() => {
+  pingDeviceSockets()
   reapDeadSockets()
   pruneActiveRuns()
+  pruneOutbox()
   refreshPinnedSnapshot()
   broadcastEvent({ type: 'event', event: 'tick', payload: null, seq: nextEventSeq(), stateVersion: null })
 }, TICK_INTERVAL_MS)
@@ -609,6 +696,9 @@ function handleConnect(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
     },
   })
   process.stderr.write(`clawvibe-daemon: device authenticated id=${device.device_id} name="${device.device_name}"\n`)
+  // After hello_ok, never before: the app must have its session before it can
+  // make sense of a replayed chat event.
+  flushOutbox(ws, device.device_id)
 }
 
 function parseSensoryTags(message: string): { context?: string; location?: string; voiceData?: unknown } {
@@ -938,6 +1028,9 @@ function startHttpServer() {
           handshakeTimers.set(ws, timer)
           process.stderr.write('clawvibe-daemon: ws open (gateway) — sent challenge\n')
         }
+      },
+      pong(ws) {
+        lastPong.set(ws, Date.now())
       },
       close(ws, code) {
         const timer = handshakeTimers.get(ws)

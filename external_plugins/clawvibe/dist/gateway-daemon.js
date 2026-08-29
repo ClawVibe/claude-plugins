@@ -64,6 +64,8 @@ var HOSTNAME = process.env.CLAWVIBE_HOSTNAME ?? "127.0.0.1";
 var TICK_INTERVAL_MS = Number(process.env.CLAWVIBE_TICK_INTERVAL_MS) || 30000;
 var HANDSHAKE_TIMEOUT_MS = 1e4;
 var ACTIVE_RUN_TTL_MS = Number(process.env.CLAWVIBE_ACTIVE_RUN_TTL_MS) || 5 * 60 * 1000;
+var OUTBOX_TTL_MS = Number(process.env.CLAWVIBE_OUTBOX_TTL_MS) || 5 * 60 * 1000;
+var OUTBOX_MAX = Number(process.env.CLAWVIBE_OUTBOX_MAX) || 200;
 function ensureStateDirs() {
   mkdirSync(STATE_DIR, { recursive: true, mode: 448 });
   mkdirSync(APPROVED_DIR, { recursive: true, mode: 448 });
@@ -527,6 +529,8 @@ var ipcServer = Bun.listen({
 });
 var clients = new Map;
 var handshakeTimers = new Map;
+var outbox = new Map;
+var lastPong = new WeakMap;
 var activeRuns = new Map;
 var runsBySession = new Map;
 var runSeq = new Map;
@@ -574,6 +578,70 @@ function endRun(runId) {
     set.delete(runId);
     if (set.size === 0)
       runsBySession.delete(run.sessionKey);
+  }
+}
+function enqueueOutbox(deviceId, payload) {
+  const q = outbox.get(deviceId) ?? [];
+  q.push({ payload, ts: Date.now() });
+  while (q.length > OUTBOX_MAX)
+    q.shift();
+  outbox.set(deviceId, q);
+}
+function pruneOutbox() {
+  const now = Date.now();
+  for (const [deviceId, q] of outbox) {
+    const kept = q.filter((e) => now - e.ts <= OUTBOX_TTL_MS);
+    if (kept.length === 0)
+      outbox.delete(deviceId);
+    else if (kept.length !== q.length)
+      outbox.set(deviceId, kept);
+  }
+}
+function flushOutbox(ws, deviceId) {
+  const q = outbox.get(deviceId);
+  if (!q || q.length === 0)
+    return;
+  outbox.delete(deviceId);
+  const now = Date.now();
+  let replayed = 0;
+  for (const entry of q) {
+    if (now - entry.ts > OUTBOX_TTL_MS)
+      continue;
+    try {
+      if (ws.readyState === 1) {
+        ws.send(entry.payload);
+        replayed++;
+      }
+    } catch (err) {
+      process.stderr.write(`clawvibe-daemon: outbox replay failed: ${err}
+`);
+    }
+  }
+  process.stderr.write(`clawvibe-daemon: outbox replayed ${replayed}/${q.length} event(s) to device=${deviceId}
+`);
+}
+function pingDeviceSockets() {
+  const now = Date.now();
+  const deadline = TICK_INTERVAL_MS * 2.5;
+  for (const set of clients.values()) {
+    for (const ws of set) {
+      if (ws.readyState !== 1)
+        continue;
+      const seen = lastPong.get(ws);
+      if (seen !== undefined && now - seen > deadline) {
+        process.stderr.write(`clawvibe-daemon: no pong in ${Math.round((now - seen) / 1000)}s, closing device=${ws.data.device_id}
+`);
+        try {
+          ws.close(4002, "no pong");
+        } catch {}
+        continue;
+      }
+      if (seen === undefined)
+        lastPong.set(ws, now);
+      try {
+        ws.ping();
+      } catch {}
+    }
   }
 }
 function reapDeadSockets() {
@@ -639,8 +707,11 @@ function broadcastEvent(frame, targetDeviceId) {
   else
     for (const set of clients.values())
       set.forEach(send);
+  if (targetDeviceId && sent === 0 && frame.event === "chat") {
+    enqueueOutbox(targetDeviceId, payload);
+  }
   if (frame.event !== "tick") {
-    process.stderr.write(`clawvibe-daemon: broadcast event=${frame.event} sent=${sent} skipped=${skipped}
+    process.stderr.write(`clawvibe-daemon: broadcast event=${frame.event} sent=${sent} skipped=${skipped}` + (targetDeviceId && sent === 0 && frame.event === "chat" ? ` queued=${outbox.get(targetDeviceId)?.length ?? 0}` : "") + `
 `);
   }
 }
@@ -671,8 +742,10 @@ function broadcastChatEvent(runId, sessionKey, state, opts = {}) {
   }, opts.targetDeviceId);
 }
 setInterval(() => {
+  pingDeviceSockets();
   reapDeadSockets();
   pruneActiveRuns();
+  pruneOutbox();
   refreshPinnedSnapshot();
   broadcastEvent({ type: "event", event: "tick", payload: null, seq: nextEventSeq(), stateVersion: null });
 }, TICK_INTERVAL_MS);
@@ -819,6 +892,7 @@ function handleConnect(ws, req) {
   });
   process.stderr.write(`clawvibe-daemon: device authenticated id=${device.device_id} name="${device.device_name}"
 `);
+  flushOutbox(ws, device.device_id);
 }
 function parseSensoryTags(message) {
   let context, location, voiceData;
@@ -1143,6 +1217,9 @@ function startHttpServer() {
           process.stderr.write(`clawvibe-daemon: ws open (gateway) \u2014 sent challenge
 `);
         }
+      },
+      pong(ws) {
+        lastPong.set(ws, Date.now());
       },
       close(ws, code) {
         const timer = handshakeTimers.get(ws);
