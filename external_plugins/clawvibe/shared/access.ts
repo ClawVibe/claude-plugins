@@ -15,17 +15,40 @@ import { join } from 'path'
 export const STATE_DIR = process.env.CLAWVIBE_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'clawvibe')
 export const ACCESS_FILE = join(STATE_DIR, 'access.json')
 export const APPROVED_DIR = join(STATE_DIR, 'approved')
+/** Where the outbox is spilled so a daemon restart doesn't destroy it (#43). */
+export const PENDING_DIR = join(STATE_DIR, 'pending')
 export const PID_FILE = join(STATE_DIR, 'server.pid')
 export const SOCK_FILE = join(STATE_DIR, 'gateway.sock')
 export const PORT = Number(process.env.CLAWVIBE_PORT ?? 8791)
 export const HOSTNAME = process.env.CLAWVIBE_HOSTNAME ?? '127.0.0.1'
-export const TICK_INTERVAL_MS = 30_000
+// Overridable so the run-bookkeeping regression (#24) can watch the abort
+// safety net fire without waiting five minutes. Production never sets these.
+export const TICK_INTERVAL_MS = Number(process.env.CLAWVIBE_TICK_INTERVAL_MS) || 30_000
 export const HANDSHAKE_TIMEOUT_MS = 10_000
-export const ACTIVE_RUN_TTL_MS = 5 * 60 * 1000
+export const ACTIVE_RUN_TTL_MS = Number(process.env.CLAWVIBE_ACTIVE_RUN_TTL_MS) || 5 * 60 * 1000
+/** Per-device outbox: how long an undelivered chat event is worth replaying (#23). */
+export const OUTBOX_TTL_MS = Number(process.env.CLAWVIBE_OUTBOX_TTL_MS) || 5 * 60 * 1000
+/** Hard cap per device, so a phone that never comes back cannot leak the daemon's heap. */
+export const OUTBOX_MAX = Number(process.env.CLAWVIBE_OUTBOX_MAX) || 200
+/** chat.history: bounded per-sessionKey transcript cache (#44). Not durable storage. */
+export const HISTORY_TTL_MS = Number(process.env.CLAWVIBE_HISTORY_TTL_MS) || 60 * 60 * 1000
+export const HISTORY_MAX = Number(process.env.CLAWVIBE_HISTORY_MAX) || 100
+/** Defaults when the client omits them; the client currently sends 20 / 20000. */
+export const HISTORY_DEFAULT_LIMIT = 20
+export const HISTORY_DEFAULT_MAX_CHARS = 20_000
+/**
+ * How long to coalesce outbox writes before spilling to disk (#43).
+ *
+ * The outbox is only ever written for a device that is NOT connected, so this
+ * is off the delivery fast path already; the debounce is what stops a burst of
+ * queued events becoming a burst of file writes.
+ */
+export const OUTBOX_PERSIST_DEBOUNCE_MS = Number(process.env.CLAWVIBE_OUTBOX_PERSIST_DEBOUNCE_MS) || 1000
 
 export function ensureStateDirs(): void {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(APPROVED_DIR, { recursive: true, mode: 0o700 })
+  mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
 }
 
 // ── Access state ─────────────────────────────────────────────────────────────
