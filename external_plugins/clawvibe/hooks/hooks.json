@@ -1,0 +1,15 @@
+{
+  "description": "Backstop for channel agents: block a Stop when a channel turn produced no reply tool call.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/reply-guard.ts\""
+          }
+        ]
+      }
+    ]
+  }
+}
