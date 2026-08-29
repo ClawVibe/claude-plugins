@@ -14245,6 +14245,8 @@ var mcp = new Server({ name: "clawvibe", version: "0.1.7" }, {
   },
   instructions: `ClawVibe mobile channel. Device users cannot see your transcript \u2014 reach them only via the \`reply\` tool.
 ` + `
+` + `SAME CHANNEL \u2014 always answer on the channel the message ARRIVED on. A message tagged source="clawvibe" is answered with THIS \`reply\` tool; one tagged source="telegram" (or any other channel) is answered with that channel's own reply tool. Reply on the wrong one and the person who asked receives nothing. Replying elsewhere as well is fine; replying ONLY elsewhere is silence.
+` + `
 ` + `Inbound device messages arrive as <channel source="clawvibe" conversation_id="..." message_id="..."> \u2026 </channel>.
 ` + `The device may append sensory tags: [CONTEXT: ...], [LOCATION: ...], [VOICE_DATA: ...]. Treat them as ambient awareness.
 ` + `
