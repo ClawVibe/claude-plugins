@@ -8,6 +8,7 @@
     "start": "bun dist/channel-client.js",
     "daemon": "bun dist/gateway-daemon.js",
     "test:storm": "bun test/storm-regression.ts",
+    "test:runs": "bun test/run-keying.ts",
     "test:pins": "bun test/pins.test.ts",
     "test:listing": "bun test/listing.ts",
     "test:reachability": "bun test/reachability.ts",
