@@ -6,9 +6,11 @@
  *   clawvibe agent add <id> [--emoji E] [--model M] [--prompt P]
  *   clawvibe agent rm <id> [--purge]
  *   clawvibe agent list
- *   clawvibe agents up                   idempotently start every configured agent
+ *   clawvibe agents up [id...]           idempotently start every configured agent (or just the named ones)
  *   clawvibe agents restart              down + stop the gateway daemon + up (use after a plugin upgrade)
- *   clawvibe agents down                 stop all clawvibe-* sessions
+ *   clawvibe agents restart <id...>      restart only those agents; the gateway daemon is left alone
+ *   clawvibe agent restart <id>          singular alias for the targeted form
+ *   clawvibe agents down [id...]         stop all clawvibe-* sessions (or just the named ones)
  *   clawvibe doctor                      diagnose install/ingress/agent problems
  *   clawvibe install-service             systemd --user unit that runs `agents up` at login/boot
  *   clawvibe update [--ref R] [--build] [--no-restart] [--force]
@@ -233,9 +235,29 @@ async function cmdAgentList(): Promise<number> {
 
 // ── agents up/down ──────────────────────────────────────────────────────────
 
-async function cmdAgentsUp(): Promise<number> {
-  const cfg = readConfig()
-  if (cfg.length === 0) { console.log(C.dim('no managed agents configured')); return 0 }
+/**
+ * Resolve caller-supplied ids against the managed-agent config.
+ *
+ * Validation happens BEFORE anything is stopped: a typo in a targeted restart must not
+ * leave half the fleet down. Returns undefined when any id is unknown.
+ */
+function selectAgents(cfg: ManagedAgent[], only?: string[]): ManagedAgent[] | undefined {
+  if (!only || only.length === 0) return cfg
+  const wanted = [...new Set(only)]
+  const missing = wanted.filter(id => !cfg.some(a => a.id === id))
+  if (missing.length > 0) {
+    console.error(C.err(`unknown agent(s): ${missing.join(', ')}`))
+    console.error(C.dim(`  configured: ${cfg.map(a => a.id).join(', ') || '(none)'}`))
+    return undefined
+  }
+  return cfg.filter(a => wanted.includes(a.id))
+}
+
+async function cmdAgentsUp(only?: string[]): Promise<number> {
+  const all = readConfig()
+  if (all.length === 0) { console.log(C.dim('no managed agents configured')); return 0 }
+  const cfg = selectAgents(all, only)
+  if (!cfg) return 1
   const running = await runningByName()
   let started = 0, skipped = 0
   const toPin: string[] = []
@@ -285,13 +307,15 @@ async function cmdAgentsUp(): Promise<number> {
   return 0
 }
 
-async function cmdAgentsDown(): Promise<number> {
+async function cmdAgentsDown(only?: string[]): Promise<number> {
+  const targeted = only && only.length > 0 ? new Set(only) : undefined
   const running = await runningByName()
   let stopped = 0
   const toUnpin: string[] = []
   const paused = new Set(readPaused())
   for (const [name, sess] of Object.entries(running)) {
     if (!name.startsWith('clawvibe-')) continue
+    if (targeted && !targeted.has(name.slice('clawvibe-'.length))) continue
     await sh(['claude', 'stop', sess.id])
     stopped++
     if (sess.id) toUnpin.push(sess.id)
@@ -434,6 +458,39 @@ async function cmdAgentsRestart(): Promise<number> {
     return 1
   } else console.log(C.ok(`  gateway ${h.version ?? '?'} ✓`))
   return rc
+}
+
+/**
+ * Restart SOME agents, leaving the rest of the fleet — and the gateway — running.
+ *
+ * The daemon cycle in `cmdAgentsRestart` exists purely for the plugin-upgrade trap: a
+ * lingering old daemon owns :PORT and new clients silently reattach to it. That is a
+ * fleet-wide, version-wide event. Reloading one agent's definition is not, and taking
+ * the gateway down for it would drop every other agent's device connection — so this
+ * path deliberately does not touch it.
+ *
+ * Ids are validated up front, before a single session is stopped, so a typo cannot
+ * leave an agent down. Relaunch goes through `cmdAgentsUp`, which is the one place that
+ * knows about pins, extra --channels and --model.
+ */
+async function cmdAgentsRestartSome(ids: string[]): Promise<number> {
+  const cfg = readConfig()
+  if (cfg.length === 0) { console.log(C.dim('no managed agents configured')); return 1 }
+  const sel = selectAgents(cfg, ids)
+  if (!sel) return 1
+  const targets = sel.map(a => a.id)
+
+  console.log(`agents restart — ${targets.join(', ')}${C.dim(' (gateway left running)')}:`)
+  await cmdAgentsDown(targets)
+  // A stopped session takes a moment to leave `claude agents --json`; relaunching into a
+  // roster that still lists the old name makes resolveIdByName see two matches and refuse
+  // to pin, which is the silent "works now, gone in an hour" failure.
+  for (let i = 0; i < 20; i++) {
+    const live = await runningByName()
+    if (!targets.some(id => live[`clawvibe-${id}`])) break
+    await sleep(250)
+  }
+  return cmdAgentsUp(targets)
 }
 
 // ── doctor ────────────────────────────────────────────────────────────────────
@@ -949,16 +1006,26 @@ async function main(): Promise<number> {
     case 'tailscale-check': { console.log('ClawVibe ingress check:'); await checkTailscale(false); return 0 }
     case 'install-service': return cmdInstallService()
     case 'update': return cmdUpdate([sub, ...rest].filter(Boolean))
-    case 'agents':
-      if (sub === 'up') return cmdAgentsUp()
-      if (sub === 'down') return cmdAgentsDown()
-      if (sub === 'restart') return cmdAgentsRestart()
-      console.error('usage: clawvibe agents <up|down|restart>'); return 1
+    case 'agents': {
+      // Bare ids only: flags are not part of these verbs, and silently treating `--foo`
+      // as an agent name would fail the id lookup with a confusing message.
+      const ids = rest.filter(a => !a.startsWith('--'))
+      if (sub === 'up') return cmdAgentsUp(ids)
+      if (sub === 'down') return cmdAgentsDown(ids)
+      // No ids = the upgrade path: whole fleet + gateway. With ids, only those agents.
+      if (sub === 'restart') return ids.length > 0 ? cmdAgentsRestartSome(ids) : cmdAgentsRestart()
+      console.error('usage: clawvibe agents <up|down|restart> [id...]'); return 1
+    }
     case 'agent':
       if (sub === 'add') return cmdAgentAdd(rest)
       if (sub === 'rm') return cmdAgentRm(rest)
       if (sub === 'list') return cmdAgentList()
-      console.error('usage: clawvibe agent <add|rm|list> …'); return 1
+      if (sub === 'restart') {
+        const ids = rest.filter(a => !a.startsWith('--'))
+        if (ids.length === 0) { console.error('usage: clawvibe agent restart <id> [id...]'); return 1 }
+        return cmdAgentsRestartSome(ids)
+      }
+      console.error('usage: clawvibe agent <add|rm|list|restart> …'); return 1
     default:
       console.error(`unknown command: ${verb}`); return 1
   }

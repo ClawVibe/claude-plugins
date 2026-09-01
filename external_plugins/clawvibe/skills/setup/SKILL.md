@@ -97,6 +97,11 @@ claude plugin update clawvibe@clawvibe-plugins
 clawvibe agents restart      # down → stop daemon → confirm port free → up → verify version
 ```
 
+Note this is the **fleet-wide** form. To reload a single agent's definition (its tools,
+persona or model) without dropping everyone else, pass ids — `clawvibe agents restart
+<id>…` or `clawvibe agent restart <id>` — which cycles only those sessions and leaves
+the gateway daemon alone.
+
 `doctor` flags this as `gateway serving X but Y is installed`. If the CLI itself is stale
 (e.g. `agents restart` is missing), repoint the symlink first — see "Fresh install".
 

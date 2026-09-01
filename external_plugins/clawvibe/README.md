@@ -51,8 +51,18 @@ The `<id>` is the routing slug (it becomes `name:` in the def and the `--agent` 
 clawvibe agent add patrick --name "Patrick" --emoji ⭐ [--model <m>] [--prompt "<persona>"]
 clawvibe agent list                  # configured agents + running/registered status
 clawvibe agents up | down            # start all / stop all
+clawvibe agents up | down <id...>    # …or just the named ones
+clawvibe agent restart <id>          # reload one agent's definition, fleet + gateway untouched
 clawvibe agent rm <id> [--purge]     # unconfigure (--purge also deletes the def)
 ```
+
+Restart is two different operations. `clawvibe agents restart` with **no ids** is the
+upgrade path: it stops every agent *and* the gateway daemon, because a lingering old
+daemon owns the port and new clients would otherwise silently reattach to the old
+bundle. With **ids** — `clawvibe agents restart rovo nemo`, or `clawvibe agent restart
+rovo` — only those sessions are cycled and the gateway is left running, so no other
+agent's device connection drops. That is the form to use after editing an agent's
+`~/.claude/agents/<id>.md`. Unknown ids fail before anything is stopped.
 
 `clawvibe install-service` writes a `systemd --user` unit (`clawvibe-agents.service`) that runs `clawvibe agents up` at login/boot. For start-at-boot without an active login, run `sudo loginctl enable-linger $USER`. (Linux/systemd; macOS launchd is a follow-up.) Claude Code must be authenticated for the user the unit runs as.
 
