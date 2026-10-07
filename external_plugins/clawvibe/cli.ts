@@ -39,6 +39,17 @@ const PAUSED = join(STATE_DIR, 'paused.json')
 const LOCAL_BIN = join(homedir(), '.local', 'bin', 'clawvibe')
 const UNIT_PATH = join(homedir(), '.config', 'systemd', 'user', 'clawvibe-agents.service')
 const CHANNEL = 'plugin:clawvibe@clawvibe-plugins'
+/**
+ * Working directory every managed agent is launched from. Must be a persistently
+ * trusted directory: Claude Code no longer persists trust for $HOME itself.
+ */
+const AGENT_CWD = process.env.CLAWVIBE_AGENT_CWD ?? join(homedir(), 'clawvibe-agents')
+
+/** The refusal line `claude --bg` prints (with exit 0) for an untrusted cwd, if present. */
+function untrustedRefusal(output: string): string | undefined {
+  return output.match(/Workspace not trusted[^\n]*/)?.[0]
+}
+
 const REPLY_TOOLS = ['mcp__plugin_clawvibe_clawvibe__reply', 'mcp__plugin_clawvibe_clawvibe__edit_message']
 // The "never finished" wording is load-bearing, not politeness. Claude Code's bg daemon
 // reaps sessions it considers SETTLED after an idle TTL; a session that is waiting for
@@ -284,11 +295,21 @@ async function cmdAgentsUp(only?: string[]): Promise<number> {
       ...(a.model ? ['--model', a.model] : []),
       '--name', name, SEED,
     ]
-    // Launch from $HOME (a trusted dir) so the bg session doesn't block on a
-    // directory-trust prompt; a channel agent has no project-specific cwd.
+    // Launch from a dedicated agent dir, NOT $HOME. Since CLI ~2.1.29x, $HOME is only
+    // ever trusted one session at a time, so `claude --bg` from $HOME refuses with
+    // "Workspace not trusted" and every agent silently fails to start. AGENT_CWD sits
+    // under $HOME so ~/CLAUDE.md still loads; it must be trusted once (see doctor).
     // Identity vars are scrubbed so the new agent cannot inherit ours.
-    const { code, err } = await sh(cmd, homedir(), scrubbedEnv())
-    if (code !== 0) { console.log(C.err(`  ${a.id}: failed (${err.trim().slice(0, 120)})`)); continue }
+    mkdirSync(AGENT_CWD, { recursive: true })
+    const { code, out, err } = await sh(cmd, AGENT_CWD, scrubbedEnv())
+    // `claude --bg` exits 0 even when it refuses to launch, so the exit code alone
+    // can't be trusted — check the output for the refusal too.
+    const refusal = untrustedRefusal(out + err)
+    if (code !== 0 || refusal) {
+      console.log(C.err(`  ${a.id}: failed (${(refusal ?? err.trim()).slice(0, 200)})`))
+      if (refusal) console.log(C.dim(`      fix: cd ${AGENT_CWD} && claude   # accept the trust prompt once, then: clawvibe agents up`))
+      continue
+    }
     started++
     const id = await resolveIdByName(name)
     if (id) { toPin.push(id); console.log(C.ok(`  ${a.id}: started`) + C.dim(` (${id})`)) }
@@ -566,6 +587,18 @@ async function cmdDoctor(): Promise<number> {
   if (!h.up) checks.push({ label: 'gateway', level: 'warn', detail: `nothing serving :${PORT} — it spawns with the first agent client`, fix: 'clawvibe agents up' })
   else if (version && h.version !== version) checks.push({ label: 'gateway', level: 'fail', detail: `serving ${h.version} but ${version} is installed — a stale daemon owns :${PORT}`, fix: 'clawvibe agents restart' })
   else checks.push({ label: 'gateway', level: 'ok', detail: `${h.version} on :${PORT}` })
+  // Agents launch from AGENT_CWD; if it isn't trusted, `claude --bg` refuses (exit 0)
+  // and no agent ever starts. Trust lives in ~/.claude.json, read-only here.
+  {
+    let trusted: boolean | undefined
+    try {
+      const cfgPath = join(process.env.CLAUDE_CONFIG_DIR ?? homedir(), '.claude.json')
+      trusted = (JSON.parse(readFileSync(cfgPath, 'utf8')) as any)?.projects?.[AGENT_CWD]?.hasTrustDialogAccepted === true
+    } catch { trusted = undefined }
+    const shown = AGENT_CWD.replace(homedir(), '~')
+    if (trusted === false) checks.push({ label: 'agent workspace', level: 'fail', detail: `${shown} is not trusted — every agent launch is refused`, fix: `mkdir -p ${AGENT_CWD} && cd ${AGENT_CWD} && claude   # accept the trust prompt once` })
+    else if (trusted === true) checks.push({ label: 'agent workspace', level: 'ok', detail: `${shown} trusted` })
+  }
 
   // Stale clients are the reason an upgrade silently doesn't take: they respawn the old
   // daemon. Worth naming explicitly rather than leaving it as a mysterious version skew.
