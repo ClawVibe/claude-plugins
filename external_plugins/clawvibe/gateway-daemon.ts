@@ -264,7 +264,7 @@ function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
       // Prefer the run the agent is actually answering; fall back to the newest
       // open run on the conversation for replies that carry no runId.
       const run = (frame.runId ? activeRuns.get(frame.runId) : undefined) ?? currentRun(frame.sessionKey)
-      const targetDeviceId = run?.deviceId ?? deviceIdFromSessionKey(frame.sessionKey) ?? undefined
+      const targetDeviceId = run?.deviceId ?? deviceForSession(frame.sessionKey) ?? undefined
       if (!targetDeviceId) {
         // Not falling back to every connected device: the key names its
         // device, so guessing would risk another user's phone.
@@ -284,7 +284,7 @@ function handleIpcFrame(sock: Socket<SockState>, frame: IpcFrame): void {
       // Same reasoning as `reply`: an edit to an unprompted message has no run
       // either, and dropping it would strand the message it edits (#29).
       const run = currentRun(frame.sessionKey)
-      const targetDeviceId = run?.deviceId ?? deviceIdFromSessionKey(frame.sessionKey) ?? undefined
+      const targetDeviceId = run?.deviceId ?? deviceForSession(frame.sessionKey) ?? undefined
       if (!targetDeviceId) return
       broadcastChatEvent(frame.messageId, frame.sessionKey, 'final', {
         text: frame.text,
@@ -373,6 +373,7 @@ function nextRunSeq(runId: string): number {
 
 function startRun(sessionKey: string, runId: string, deviceId: string): void {
   activeRuns.set(runId, { runId, sessionKey, ts: Date.now(), deviceId })
+  rememberSessionDevice(sessionKey, deviceId)
   let set = runsBySession.get(sessionKey)
   if (!set) { set = new Set(); runsBySession.set(sessionKey, set) }
   set.add(runId)
@@ -396,6 +397,66 @@ function endRun(runId: string): void {
   activeRuns.delete(runId)
   const set = runsBySession.get(run.sessionKey)
   if (set) { set.delete(runId); if (set.size === 0) runsBySession.delete(run.sessionKey) }
+}
+
+// ── Session -> device (#55) ──────────────────────────────────────────────────
+//
+// #29 let a reply with no open run fall back to deviceIdFromSessionKey, on the
+// premise that "agent:<id>:clawvibe:app:<x>" names its device. It does not:
+// the iOS app puts its own conversation UUID in <x>, while the device
+// authenticates as "device-<hex>". So once the first reply of a turn ('final')
+// closed the run, every later reply in that turn was routed to a device that
+// does not exist, logged "unprompted ... sent=0 queued=1" and was never
+// delivered, while the agent was told "sent". The same mismatch made
+// chat.history refuse the real owner, so backfill could not recover it either.
+//
+// The fix: remember which device actually sent on each session, and prefer
+// that for routing and for the history ownership check. Learned at chat.send,
+// NOT cleared by endRun (outliving the run is the whole point), persisted so
+// a daemon restart does not reopen the hole, and bounded so it cannot grow
+// without limit. Latest sender wins, which also follows a re-pair.
+const SESSION_DEVICE_FILE = join(STATE_DIR, 'session-devices.json')
+const SESSION_DEVICE_MAX = 500
+const sessionDevice = new Map<string, string>()
+
+function persistSessionDevices(): void {
+  try {
+    const tmp = `${SESSION_DEVICE_FILE}.tmp`
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(sessionDevice)) + '\n', { mode: 0o600 })
+    renameSync(tmp, SESSION_DEVICE_FILE)
+  } catch (err) {
+    process.stderr.write(`clawvibe-daemon: session-devices persist failed: ${err}\n`)
+  }
+}
+
+/** Record the device a session's inbound came from. Writes only on change. */
+function rememberSessionDevice(sessionKey: string, deviceId: string): void {
+  if (!sessionKey || !deviceId) return
+  if (sessionDevice.get(sessionKey) === deviceId) return
+  sessionDevice.delete(sessionKey) // re-insert so Map order tracks recency
+  sessionDevice.set(sessionKey, deviceId)
+  while (sessionDevice.size > SESSION_DEVICE_MAX) {
+    const oldest = sessionDevice.keys().next().value
+    if (oldest === undefined) break
+    sessionDevice.delete(oldest)
+  }
+  persistSessionDevices()
+}
+
+/** Reload at start, keeping only devices that are still approved. */
+function loadSessionDevices(approved: Record<string, ApprovedDevice>): void {
+  let raw: unknown
+  try { raw = JSON.parse(readFileSync(SESSION_DEVICE_FILE, 'utf8')) } catch { return }
+  if (!raw || typeof raw !== 'object') return
+  for (const [key, dev] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof dev === 'string' && approved[dev]) sessionDevice.set(key, dev)
+  }
+  process.stderr.write(`clawvibe-daemon: loaded ${sessionDevice.size} session->device mappings\n`)
+}
+
+/** The device a session belongs to: learned sender first, key parse second. */
+function deviceForSession(sessionKey: string): string | null {
+  return sessionDevice.get(sessionKey) ?? deviceIdFromSessionKey(sessionKey)
 }
 
 // ── Outbox persistence (#43) ─────────────────────────────────────────────────
@@ -873,7 +934,7 @@ function handleChatHistory(ws: ServerWebSocket<WSData>, req: RequestFrame): void
   // socket could read another device's transcript just by asking for its key.
   // Answer empty rather than erroring: the requester learns nothing about
   // whether that session exists.
-  const owner = deviceIdFromSessionKey(sessionKey)
+  const owner = deviceForSession(sessionKey)
   if (owner && owner !== ws.data.device_id) {
     process.stderr.write(`clawvibe-daemon: chat.history refused, device=${ws.data.device_id} asked for session owned by ${owner}\n`)
     sendFrame(ws, { type: 'res', id: req.id, ok: true, payload: { messages: [] } })
@@ -1315,6 +1376,7 @@ process.stderr.write(`clawvibe-daemon: listening on http://${HOSTNAME}:${PORT} (
 
 // Reload anything the previous daemon still owed an absent device (#43).
 loadOutbox(readAccess().approved)
+loadSessionDevices(readAccess().approved)
 
 // Populate the pinned-session snapshot immediately, so the first agents.list after
 // a daemon start isn't answered from an empty one.
