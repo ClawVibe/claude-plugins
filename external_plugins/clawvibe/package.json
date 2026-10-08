@@ -17,6 +17,7 @@
     "test:listing": "bun test/listing.ts",
     "test:reachability": "bun test/reachability.ts",
     "test:unprompted": "bun test/unprompted.ts",
+    "test:multireply": "bun test/multi-reply.ts",
     "test:update": "bun test/update.test.ts",
     "test:restart": "bun test/agent-restart.test.ts"
   },
