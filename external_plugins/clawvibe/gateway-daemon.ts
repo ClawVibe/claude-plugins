@@ -1025,6 +1025,36 @@ function handleChatSend(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   }
 }
 
+/**
+ * The user started speaking (#57). Forwarded to the agent only while it is still
+ * answering them — an open run means no final reply yet — so it can hold that
+ * answer and reply to everything together. With no open run there is nothing to
+ * hold, and the agent is not woken for it.
+ */
+function handleVoiceActivity(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
+  const params = req.params ?? {}
+  const sessionKey = (params.sessionKey as string) ?? `device:${ws.data.device_id}`
+  const state = typeof params.state === 'string' ? params.state : 'started'
+  sendFrame(ws, { type: 'res', id: req.id, ok: true, payload: { ok: true } })
+
+  const run = currentRun(sessionKey)
+  if (state !== 'started' || !run) return
+  const agentId = agentIdFromSessionKey(sessionKey) ?? pickFallbackAgentId()
+  const conn = (agentId ? connForAgent(agentId) : undefined) ?? (agentId ? connForJob(agentId) : undefined)
+  if (!conn) return
+  process.stderr.write(`clawvibe-daemon: voice.activity ${state} session=${sessionKey} run=${run.runId} -> ${conn.agentId}\n`)
+  writeIpc(conn.sock, {
+    v: 1, t: 'activity', sessionKey, state,
+    meta: {
+      device_id: ws.data.device_id,
+      device_name: ws.data.device_name,
+      conversation_id: sessionKey,
+      message_id: run.runId,
+      ts: new Date().toISOString(),
+    },
+  })
+}
+
 function handleHealth(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
   sendFrame(ws, { type: 'res', id: req.id, ok: true, payload: { ok: true } })
 }
@@ -1148,6 +1178,7 @@ function handleRPC(ws: ServerWebSocket<WSData>, req: RequestFrame): void {
     case 'agents.list': return handleAgentsList(ws, req)
     case 'agent.identity.get': return handleAgentIdentityGet(ws, req)
     case 'chat.history': return handleChatHistory(ws, req)
+    case 'voice.activity': return handleVoiceActivity(ws, req)
     default:
       sendFrame(ws, { type: 'res', id: req.id, ok: false, error: { message: `unknown method: ${req.method}` } })
   }

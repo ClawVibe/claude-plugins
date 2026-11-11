@@ -21,7 +21,7 @@ import type { Socket } from 'bun'
 import { STATE_DIR, SOCK_FILE, ensureStateDirs } from './shared/access.ts'
 import {
   makeLineDecoder, encodeFrame,
-  type IpcFrame, type IpcInbound, type InboundMeta,
+  type IpcFrame, type IpcInbound, type IpcActivity, type InboundMeta,
 } from './shared/protocol.ts'
 
 // A session only acts as a channel agent when it was launched for a specific
@@ -150,7 +150,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
-function deliverInbound(text: string, meta: InboundMeta): void {
+function deliverInbound(text: string, meta: InboundMeta, extra: Record<string, string> = {}): void {
   // The host validates params as { content: string, meta: record(string, string) }.
   // A single non-string (e.g. an absent device_name) fails validation and the WHOLE
   // notification is dropped silently — so coerce every value and omit empties.
@@ -172,6 +172,7 @@ function deliverInbound(text: string, meta: InboundMeta): void {
   }
   put('thinking', meta.thinking)
   put('timeout_ms', meta.timeout_ms)
+  for (const [k, v] of Object.entries(extra)) put(k, v)
 
   mcp.notification({
     method: 'notifications/claude/channel',
@@ -198,6 +199,23 @@ function onInbound(frame: IpcInbound): void {
   // the probe conversation (confirming liveness) instead of leaking to a device.
   lastSessionKey = frame.sessionKey
   deliverInbound(frame.text, frame.meta)
+}
+
+/**
+ * The user started speaking while this agent is still answering them (#57).
+ * Deliberately leaves convToRun and lastSessionKey alone: this is a signal, not
+ * a message, and the agent's next reply must still route to the real run.
+ */
+const USER_SPEAKING_TEXT =
+  '[USER_SPEAKING] The user has started speaking again before your answer. ' +
+  'If you have not replied to their last message yet, hold that reply: wait for ' +
+  'their next message and answer everything together. If you have already ' +
+  'replied, do nothing; the app will not play it over them. Do not call reply ' +
+  'for this notice.'
+
+function onActivity(frame: IpcActivity): void {
+  if (frame.state !== 'started') return
+  deliverInbound(USER_SPEAKING_TEXT, frame.meta, { event: 'user_speaking' })
 }
 
 // ── IPC connection to the daemon (auto-spawn + reconnect) ─────────────────────
@@ -263,7 +281,7 @@ async function connectDaemon(): Promise<void> {
           unix: SOCK_FILE,
           socket: {
             open(s) {
-              s.data = { decode: makeLineDecoder(f => { if (f.t === 'inbound') onInbound(f) }) }
+              s.data = { decode: makeLineDecoder(f => { if (f.t === 'inbound') onInbound(f); else if (f.t === 'activity') onActivity(f) }) }
             },
             data(s, data) { s.data.decode(data) },
             close() {

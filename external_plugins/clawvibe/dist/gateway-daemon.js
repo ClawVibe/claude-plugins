@@ -1,5 +1,49 @@
 #!/usr/bin/env bun
 // @bun
+var __create = Object.create;
+var __getProtoOf = Object.getPrototypeOf;
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+function __accessProp(key) {
+  return this[key];
+}
+var __toESMCache_node;
+var __toESMCache_esm;
+var __toESM = (mod, isNodeMode, target) => {
+  var canCache = mod != null && typeof mod === "object";
+  if (canCache) {
+    var cache = isNodeMode ? __toESMCache_node ??= new WeakMap : __toESMCache_esm ??= new WeakMap;
+    var cached = cache.get(mod);
+    if (cached)
+      return cached;
+  }
+  target = mod != null ? __create(__getProtoOf(mod)) : {};
+  const to = isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
+  for (let key of __getOwnPropNames(mod))
+    if (!__hasOwnProp.call(to, key))
+      __defProp(to, key, {
+        get: __accessProp.bind(mod, key),
+        enumerable: true
+      });
+  if (canCache)
+    cache.set(mod, to);
+  return to;
+};
+var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __returnValue = (v) => v;
+function __exportSetter(name, newValue) {
+  this[name] = __returnValue.bind(null, newValue);
+}
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, {
+      get: all[name],
+      enumerable: true,
+      configurable: true,
+      set: __exportSetter.bind(all, name)
+    });
+};
 
 // gateway-daemon.ts
 import { randomBytes as randomBytes2 } from "crypto";
@@ -247,7 +291,7 @@ async function liveSessions() {
   } catch (err) {
     if (!warnedFailure) {
       warnedFailure = true;
-      process.stderr.write(`clawvibe-daemon: session roster unavailable (${err}) — listing confirmed agents only
+      process.stderr.write(`clawvibe-daemon: session roster unavailable (${err}) \u2014 listing confirmed agents only
 `);
     }
     return [];
@@ -263,7 +307,7 @@ async function pinnedLiveSessions() {
 // .claude-plugin/plugin.json
 var plugin_default = {
   name: "clawvibe",
-  description: "ClawVibe mobile channel — pair an iOS device and chat with this Claude Code instance over a secure WebSocket. Includes format directives ([SPEAK]/[TEXT]/---) for TTS-aware clients.",
+  description: "ClawVibe mobile channel \u2014 pair an iOS device and chat with this Claude Code instance over a secure WebSocket. Includes format directives ([SPEAK]/[TEXT]/---) for TTS-aware clients.",
   version: "0.1.10",
   keywords: ["channel", "mobile", "ios", "clawvibe", "voice"]
 };
@@ -381,7 +425,7 @@ function probeAgent(conn) {
     t: "inbound",
     sessionKey,
     runId,
-    text: `[CLAWVIBE_PING ${nonce}] automated liveness check — reply "pong" to this conversation with your name and emoji.`,
+    text: `[CLAWVIBE_PING ${nonce}] automated liveness check \u2014 reply "pong" to this conversation with your name and emoji.`,
     meta: { device_id: "", device_name: "clawvibe", conversation_id: sessionKey, message_id: runId, ts: new Date().toISOString() }
   });
   process.stderr.write(`clawvibe-daemon: probing agent=${conn.agentId}
@@ -937,7 +981,7 @@ function handleConnect(ws, req) {
       const bt = a2.bootstrapTokens?.[bootstrapToken];
       device = bt?.paired_device_id ? a2.approved[bt.paired_device_id] : undefined;
       if (device) {
-        process.stderr.write(`clawvibe-daemon: bootstrap reused → re-auth device=${device.device_id}
+        process.stderr.write(`clawvibe-daemon: bootstrap reused \u2192 re-auth device=${device.device_id}
 `);
       } else {
         sendFrame(ws, {
@@ -959,7 +1003,7 @@ function handleConnect(ws, req) {
     }
   } else {
     device = tokenToDevice(token);
-    process.stderr.write(`clawvibe-daemon: token auth → ${device ? "OK device=" + device.device_id : "REJECTED (token not in access.json)"}
+    process.stderr.write(`clawvibe-daemon: token auth \u2192 ${device ? "OK device=" + device.device_id : "REJECTED (token not in access.json)"}
 `);
   }
   if (!device) {
@@ -1135,6 +1179,34 @@ function handleChatSend(ws, req) {
     });
   }
 }
+function handleVoiceActivity(ws, req) {
+  const params = req.params ?? {};
+  const sessionKey = params.sessionKey ?? `device:${ws.data.device_id}`;
+  const state = typeof params.state === "string" ? params.state : "started";
+  sendFrame(ws, { type: "res", id: req.id, ok: true, payload: { ok: true } });
+  const run = currentRun(sessionKey);
+  if (state !== "started" || !run)
+    return;
+  const agentId = agentIdFromSessionKey(sessionKey) ?? pickFallbackAgentId();
+  const conn = (agentId ? connForAgent(agentId) : undefined) ?? (agentId ? connForJob(agentId) : undefined);
+  if (!conn)
+    return;
+  process.stderr.write(`clawvibe-daemon: voice.activity ${state} session=${sessionKey} run=${run.runId} -> ${conn.agentId}
+`);
+  writeIpc(conn.sock, {
+    v: 1,
+    t: "activity",
+    sessionKey,
+    state,
+    meta: {
+      device_id: ws.data.device_id,
+      device_name: ws.data.device_name,
+      conversation_id: sessionKey,
+      message_id: run.runId,
+      ts: new Date().toISOString()
+    }
+  });
+}
 function handleHealth(ws, req) {
   sendFrame(ws, { type: "res", id: req.id, ok: true, payload: { ok: true } });
 }
@@ -1246,6 +1318,8 @@ function handleRPC(ws, req) {
       return handleAgentIdentityGet(ws, req);
     case "chat.history":
       return handleChatHistory(ws, req);
+    case "voice.activity":
+      return handleVoiceActivity(ws, req);
     default:
       sendFrame(ws, { type: "res", id: req.id, ok: false, error: { message: `unknown method: ${req.method}` } });
   }
@@ -1348,7 +1422,7 @@ function startHttpServer() {
           const now = Date.now();
           a.pending[code] = { device_id: deviceId, device_name: deviceName, created_at: now, expires_at: now + 10 * 60 * 1000 };
           writeAccess(a);
-          process.stderr.write(`clawvibe-daemon: pair request from "${deviceName}" — code ${code} (run: /clawvibe:access pair ${code})
+          process.stderr.write(`clawvibe-daemon: pair request from "${deviceName}" \u2014 code ${code} (run: /clawvibe:access pair ${code})
 `);
           return Response.json({ pairing_code: code, expires_at: a.pending[code].expires_at });
         })();
@@ -1409,7 +1483,7 @@ function startHttpServer() {
             }
           }, HANDSHAKE_TIMEOUT_MS);
           handshakeTimers.set(ws, timer);
-          process.stderr.write(`clawvibe-daemon: ws open (gateway) — sent challenge
+          process.stderr.write(`clawvibe-daemon: ws open (gateway) \u2014 sent challenge
 `);
         }
       },
@@ -1498,7 +1572,7 @@ function shutdown(sig) {
   if (shuttingDown)
     return;
   shuttingDown = true;
-  process.stderr.write(`clawvibe-daemon: ${sig} — shutting down
+  process.stderr.write(`clawvibe-daemon: ${sig} \u2014 shutting down
 `);
   for (const deviceId of outbox.keys())
     outboxDirty.add(deviceId);

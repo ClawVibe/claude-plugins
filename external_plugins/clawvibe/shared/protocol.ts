@@ -127,8 +127,21 @@ export type IpcInbound = {
   meta: InboundMeta
 }
 
+/**
+ * daemon → client: the device user has started speaking while this agent is
+ * still answering them (#57). A signal, not a message: it carries no run of its
+ * own and must not change which run the agent's next reply is routed to.
+ */
+export type IpcActivity = {
+  v: 1
+  t: 'activity'
+  sessionKey: string
+  state: string
+  meta: InboundMeta
+}
+
 export type IpcClientToDaemon = IpcRegister | IpcReply | IpcEdit | IpcPing
-export type IpcDaemonToClient = IpcRegisterOk | IpcInbound
+export type IpcDaemonToClient = IpcRegisterOk | IpcInbound | IpcActivity
 export type IpcFrame = IpcClientToDaemon | IpcDaemonToClient
 
 // ── sessionKey routing ───────────────────────────────────────────────────────

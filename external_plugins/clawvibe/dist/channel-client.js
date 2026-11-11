@@ -14329,7 +14329,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     return { content: [{ type: "text", text: `${req.params.name}: ${err instanceof Error ? err.message : err}` }], isError: true };
   }
 });
-function deliverInbound(text, meta2) {
+function deliverInbound(text, meta2, extra = {}) {
   const m = {};
   const put = (k, v) => {
     if (v !== undefined && v !== null)
@@ -14351,6 +14351,8 @@ function deliverInbound(text, meta2) {
   }
   put("thinking", meta2.thinking);
   put("timeout_ms", meta2.timeout_ms);
+  for (const [k, v] of Object.entries(extra))
+    put(k, v);
   mcp.notification({
     method: "notifications/claude/channel",
     params: { content: text, meta: m }
@@ -14370,6 +14372,12 @@ function onInbound(frame) {
   }
   lastSessionKey = frame.sessionKey;
   deliverInbound(frame.text, frame.meta);
+}
+var USER_SPEAKING_TEXT = "[USER_SPEAKING] The user has started speaking again before your answer. " + "If you have not replied to their last message yet, hold that reply: wait for " + "their next message and answer everything together. If you have already " + "replied, do nothing; the app will not play it over them. Do not call reply " + "for this notice.";
+function onActivity(frame) {
+  if (frame.state !== "started")
+    return;
+  deliverInbound(USER_SPEAKING_TEXT, frame.meta, { event: "user_speaking" });
 }
 var sock = null;
 var shuttingDown = false;
@@ -14432,6 +14440,8 @@ async function connectDaemon() {
               s.data = { decode: makeLineDecoder((f) => {
                 if (f.t === "inbound")
                   onInbound(f);
+                else if (f.t === "activity")
+                  onActivity(f);
               }) };
             },
             data(s, data) {
