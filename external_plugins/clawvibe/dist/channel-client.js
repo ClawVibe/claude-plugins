@@ -14374,10 +14374,13 @@ function onInbound(frame) {
   deliverInbound(frame.text, frame.meta);
 }
 var USER_SPEAKING_TEXT = "[USER_SPEAKING] The user has started speaking again before your answer. " + "If you have not replied to their last message yet, hold that reply: wait for " + "their next message and answer everything together. If you have already " + "replied, do nothing; the app will not play it over them. Do not call reply " + "for this notice.";
+var USER_STOPPED_TEXT = "[USER_SPEAKING_STOPPED] The user stopped without saying anything new (a " + "noise or a cough). If you were holding a reply to their last message, send " + "it now. Do not reply to this notice itself.";
 function onActivity(frame) {
-  if (frame.state !== "started")
-    return;
-  deliverInbound(USER_SPEAKING_TEXT, frame.meta, { event: "user_speaking" });
+  if (frame.state === "started") {
+    deliverInbound(USER_SPEAKING_TEXT, frame.meta, { event: "user_speaking" });
+  } else if (frame.state === "stopped") {
+    deliverInbound(USER_STOPPED_TEXT, frame.meta, { event: "user_speaking_stopped" });
+  }
 }
 var sock = null;
 var shuttingDown = false;

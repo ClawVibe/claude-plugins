@@ -1038,7 +1038,7 @@ function handleVoiceActivity(ws: ServerWebSocket<WSData>, req: RequestFrame): vo
   sendFrame(ws, { type: 'res', id: req.id, ok: true, payload: { ok: true } })
 
   const run = currentRun(sessionKey)
-  if (state !== 'started' || !run) return
+  if ((state !== 'started' && state !== 'stopped') || !run) return
   const agentId = agentIdFromSessionKey(sessionKey) ?? pickFallbackAgentId()
   const conn = (agentId ? connForAgent(agentId) : undefined) ?? (agentId ? connForJob(agentId) : undefined)
   if (!conn) return
